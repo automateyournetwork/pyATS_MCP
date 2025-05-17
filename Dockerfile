@@ -44,6 +44,7 @@ RUN echo "==> Installing pyATS and other Python packages..." \
     && pip install --no-cache-dir \
         pydantic \
         python-dotenv \
+        fastmcp \
         pyats[full]==25.2.0
 
 # Copy your application code into the container's working directory
