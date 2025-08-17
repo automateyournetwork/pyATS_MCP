@@ -1,4 +1,5 @@
 # pyATS MCP Server
+[![Trust Score](https://archestra.ai/mcp-catalog/api/badge/quality/automateyournetwork/pyATS_MCP)](https://archestra.ai/mcp-catalog/automateyournetwork__pyats_mcp)
 
 This project implements a Model Context Protocol (MCP) Server that wraps Cisco pyATS and Genie functionality. It enables structured, model-driven interaction with network devices over STDIO using the JSON-RPC 2.0 protocol.
 
