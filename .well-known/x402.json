@@ -1,0 +1,48 @@
+{
+  "name": "automateyournetwork/pyATS_MCP",
+  "description": "Cisco pyATS server enabling structured, model-driven interaction with network devices.",
+  "accepts": [
+    {
+      "network": "eip155:8453",
+      "asset": "USDC",
+      "address": "YOUR_WALLET_ADDRESS"
+    }
+  ],
+  "resources": [
+    {
+      "path": "/tools/discover",
+      "price": "0.01",
+      "description": "Pay-per-call access to tools/discover"
+    },
+    {
+      "path": "/tools/call",
+      "price": "0.01",
+      "description": "Pay-per-call access to tools/call"
+    },
+    {
+      "path": "/run_show_command",
+      "price": "0.01",
+      "description": "Pay-per-call access to run_show_command"
+    },
+    {
+      "path": "/run_ping_command",
+      "price": "0.01",
+      "description": "Pay-per-call access to run_ping_command"
+    },
+    {
+      "path": "/apply_configuration",
+      "price": "0.01",
+      "description": "Pay-per-call access to apply_configuration"
+    },
+    {
+      "path": "/learn_config",
+      "price": "0.01",
+      "description": "Pay-per-call access to learn_config"
+    },
+    {
+      "path": "/learn_logging",
+      "price": "0.01",
+      "description": "Pay-per-call access to learn_logging"
+    }
+  ]
+}
