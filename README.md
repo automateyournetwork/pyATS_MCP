@@ -240,3 +240,8 @@ CI/CD integration (e.g., GitHub Actions)
 Happy to help!
 
 # The testbed.yaml file works with the Cisco DevNet Cisco Modeling Labs (CML) Sandbox! 
+
+## Hosted deployment
+
+A hosted deployment is available on [Fronteir AI](https://fronteir.ai/mcp/automateyournetwork-pyats-mcp).
+
