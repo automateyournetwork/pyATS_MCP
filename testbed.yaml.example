@@ -1,0 +1,66 @@
+# testbed.yaml.example
+#
+# Copy this file to testbed.yaml and fill in your device details.
+# Credentials can be supplied via environment variables using the
+# %ENV{VAR_NAME} syntax so that secrets are never stored in plain text.
+#
+# Example:
+#   export ROUTER_USERNAME=admin
+#   export ROUTER_PASSWORD=s3cr3t
+#
+---
+devices:
+  R1:
+    alias: "Router01"
+    type: "router"
+    os: "iosxe"
+    platform: CSR1kv
+    credentials:
+      default:
+        username: "%ENV{ROUTER_USERNAME}"
+        password: "%ENV{ROUTER_PASSWORD}"
+      enable:
+        password: "%ENV{ROUTER_ENABLE_PASSWORD}"
+    connections:
+      cli:
+        protocol: ssh
+        ip: 192.0.2.1
+        port: 22
+        arguments:
+          connection_timeout: 360
+
+  SW1:
+    alias: "Switch01"
+    type: "switch"
+    os: "iosxe"
+    platform: CSR1kv
+    credentials:
+      default:
+        username: "%ENV{SWITCH_USERNAME}"
+        password: "%ENV{SWITCH_PASSWORD}"
+      enable:
+        password: "%ENV{SWITCH_ENABLE_PASSWORD}"
+    connections:
+      cli:
+        protocol: ssh
+        ip: 192.0.2.2
+        port: 22
+        arguments:
+          connection_timeout: 360
+
+  LINUX_HOST:
+    alias: "Linux Host"
+    type: "host"
+    os: "linux"
+    platform: ubuntu
+    credentials:
+      default:
+        username: "%ENV{LINUX_USERNAME}"
+        password: "%ENV{LINUX_PASSWORD}"
+    connections:
+      cli:
+        protocol: ssh
+        ip: 192.0.2.3
+        port: 22
+        arguments:
+          connection_timeout: 360

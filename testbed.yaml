@@ -111,8 +111,8 @@ devices:
     platform: ubuntu
     credentials:
       default:
-        username: johncapobianco
-        password: Timbit@123
+        username: "%ENV{DESKTOP_USERNAME}"
+        password: "%ENV{DESKTOP_PASSWORD}"
     connections:
       cli:
         protocol: ssh

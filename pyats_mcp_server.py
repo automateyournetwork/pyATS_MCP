@@ -52,10 +52,18 @@ KEEP_ARTIFACTS = os.getenv("PYATS_MCP_KEEP_ARTIFACTS", "1") == "1"
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Caching
-_CACHE_TTL_S = int(os.getenv("PYATS_MCP_TESTBED_CACHE_TTL", "30"))
+def _parse_int_env(var: str, default: int) -> int:
+    raw = os.getenv(var, str(default))
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(f"Invalid value for {var}={raw!r}; using default {default}")
+        return default
+
+_CACHE_TTL_S = _parse_int_env("PYATS_MCP_TESTBED_CACHE_TTL", 30)
 _TESTBED_CACHE: Dict[str, Any] = {"loaded_at": 0.0, "tb": None}
 
-_CONN_CACHE_TTL_S = int(os.getenv("PYATS_MCP_CONN_CACHE_TTL", "0"))
+_CONN_CACHE_TTL_S = _parse_int_env("PYATS_MCP_CONN_CACHE_TTL", 0)
 _CONN_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # -----------------------------------------------------------------------------
@@ -89,8 +97,8 @@ def _evict_expired_connections() -> None:
             if dev and getattr(dev, "is_connected", lambda: False)():
                 logger.info(f"Conn cache TTL expired; disconnecting {name}...")
                 dev.disconnect()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Error disconnecting expired connection for {name}: {e}")
         _CONN_CACHE.pop(name, None)
 
 
@@ -131,8 +139,8 @@ def _disconnect_device(device, force: bool = False):
     if _CONN_CACHE_TTL_S > 0 and not force:
         try:
             _CONN_CACHE[getattr(device, "name", "unknown")]["last_used"] = time.time()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Could not update last_used for cached device: {e}")
         return
 
     if getattr(device, "is_connected", lambda: False)():

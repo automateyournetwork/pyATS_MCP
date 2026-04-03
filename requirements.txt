@@ -1,4 +1,4 @@
-pyats[full]
-mcp
-pydantic
-python-dotenv
+pyats[full]==25.2.0
+mcp>=1.0.0,<2.0.0
+pydantic>=2.0.0,<3.0.0
+python-dotenv>=1.0.0,<2.0.0
