@@ -1,66 +1,85 @@
 # testbed.yaml.example
 #
-# Copy this file to testbed.yaml and fill in your device details.
-# Credentials can be supplied via environment variables using the
-# %ENV{VAR_NAME} syntax so that secrets are never stored in plain text.
+# Copy this file to testbed.yaml and populate every %ENV{} variable in your
+# .env file (see .env.example).  Every device has its own credentials, IP,
+# OS type, and platform — there are no shared defaults.
 #
-# Example:
-#   export ROUTER_USERNAME=admin
-#   export ROUTER_PASSWORD=s3cr3t
+# pyATS %ENV{VAR} substitution is resolved at load time from environment
+# variables, so secrets are never stored in this file.
+#
+# Supported values for 'os':
+#   iosxe, iosxr, nxos, ios, eos, junos, linux, windows
+#   Set to "generic" to let Unicon autodetect the OS on first connect.
+#
+# Supported values for 'platform':
+#   iosxe  → CSR1kv, cat9k, asr1k
+#   iosxr  → iosxrv9k, ncs5k, asr9k
+#   nxos   → n9k, n7k, n5k
+#   eos    → vEOS
+#   junos  → vmx, vsrx
+#   linux  → ubuntu, alpine, centos  (or leave blank)
+#   Set to "" (empty string) to let Unicon choose the right plugin automatically.
 #
 ---
 devices:
+
+  # ── Example: IOS-XE router ──────────────────────────────────────────────────
   R1:
-    alias: "Router01"
+    alias: "%ENV{R1_ALIAS}"
     type: "router"
-    os: "iosxe"
-    platform: CSR1kv
+    os: "%ENV{R1_OS}"                # e.g. iosxe  — or "generic" to autodetect
+    platform: "%ENV{R1_PLATFORM}"    # e.g. CSR1kv — or "" to autodetect
     credentials:
       default:
-        username: "%ENV{ROUTER_USERNAME}"
-        password: "%ENV{ROUTER_PASSWORD}"
+        username: "%ENV{R1_USERNAME}"
+        password: "%ENV{R1_PASSWORD}"
       enable:
-        password: "%ENV{ROUTER_ENABLE_PASSWORD}"
+        password: "%ENV{R1_ENABLE_PASSWORD}"
     connections:
       cli:
         protocol: ssh
-        ip: 192.0.2.1
-        port: 22
+        ip: "%ENV{R1_IP}"
+        port: "%ENV{R1_PORT}"
         arguments:
           connection_timeout: 360
+          # Set learn_os to true when os is "generic" to have pyATS detect
+          # and cache the OS type after the first successful connection:
+          # learn_os: true
 
+  # ── Example: NX-OS switch ───────────────────────────────────────────────────
   SW1:
-    alias: "Switch01"
+    alias: "%ENV{SW1_ALIAS}"
     type: "switch"
-    os: "iosxe"
-    platform: CSR1kv
+    os: "%ENV{SW1_OS}"               # e.g. nxos  — or "generic" to autodetect
+    platform: "%ENV{SW1_PLATFORM}"   # e.g. n9k   — or ""
     credentials:
       default:
-        username: "%ENV{SWITCH_USERNAME}"
-        password: "%ENV{SWITCH_PASSWORD}"
+        username: "%ENV{SW1_USERNAME}"
+        password: "%ENV{SW1_PASSWORD}"
       enable:
-        password: "%ENV{SWITCH_ENABLE_PASSWORD}"
+        password: "%ENV{SW1_ENABLE_PASSWORD}"
     connections:
       cli:
         protocol: ssh
-        ip: 192.0.2.2
-        port: 22
+        ip: "%ENV{SW1_IP}"
+        port: "%ENV{SW1_PORT}"
         arguments:
           connection_timeout: 360
 
-  LINUX_HOST:
-    alias: "Linux Host"
+  # ── Example: Linux host (no enable password needed) ─────────────────────────
+  LINUX1:
+    alias: "%ENV{LINUX1_ALIAS}"
     type: "host"
-    os: "linux"
-    platform: ubuntu
+    os: "%ENV{LINUX1_OS}"            # linux  — or "generic" to autodetect
+    platform: "%ENV{LINUX1_PLATFORM}" # e.g. ubuntu — or ""
     credentials:
       default:
-        username: "%ENV{LINUX_USERNAME}"
-        password: "%ENV{LINUX_PASSWORD}"
+        username: "%ENV{LINUX1_USERNAME}"
+        password: "%ENV{LINUX1_PASSWORD}"
     connections:
       cli:
         protocol: ssh
-        ip: 192.0.2.3
-        port: 22
+        ip: "%ENV{LINUX1_IP}"
+        port: "%ENV{LINUX1_PORT}"
         arguments:
           connection_timeout: 360
