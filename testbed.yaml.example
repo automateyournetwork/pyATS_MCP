@@ -1,85 +1,88 @@
 # testbed.yaml.example
 #
-# Copy this file to testbed.yaml and populate every %ENV{} variable in your
-# .env file (see .env.example).  Every device has its own credentials, IP,
-# OS type, and platform — there are no shared defaults.
+# Copy this file to testbed.yaml and add a matching block for every device
+# you want pyATS MCP to manage.  All sensitive values come from your .env
+# file via the %ENV{VAR} substitution — nothing is hard-coded here.
 #
-# pyATS %ENV{VAR} substitution is resolved at load time from environment
-# variables, so secrets are never stored in this file.
-#
-# Supported values for 'os':
-#   iosxe, iosxr, nxos, ios, eos, junos, linux, windows
-#   Set to "generic" to let Unicon autodetect the OS on first connect.
-#
-# Supported values for 'platform':
-#   iosxe  → CSR1kv, cat9k, asr1k
-#   iosxr  → iosxrv9k, ncs5k, asr9k
-#   nxos   → n9k, n7k, n5k
-#   eos    → vEOS
-#   junos  → vmx, vsrx
-#   linux  → ubuntu, alpine, centos  (or leave blank)
-#   Set to "" (empty string) to let Unicon choose the right plugin automatically.
+# See .env.example for the full list of variables and valid os/platform values.
 #
 ---
 devices:
 
-  # ── Example: IOS-XE router ──────────────────────────────────────────────────
-  R1:
-    alias: "%ENV{R1_ALIAS}"
-    type: "router"
-    os: "%ENV{R1_OS}"                # e.g. iosxe  — or "generic" to autodetect
-    platform: "%ENV{R1_PLATFORM}"    # e.g. CSR1kv — or "" to autodetect
-    credentials:
-      default:
-        username: "%ENV{R1_USERNAME}"
-        password: "%ENV{R1_PASSWORD}"
-      enable:
-        password: "%ENV{R1_ENABLE_PASSWORD}"
-    connections:
-      cli:
-        protocol: ssh
-        ip: "%ENV{R1_IP}"
-        port: "%ENV{R1_PORT}"
-        arguments:
-          connection_timeout: 360
-          # Set learn_os to true when os is "generic" to have pyATS detect
-          # and cache the OS type after the first successful connection:
-          # learn_os: true
-
-  # ── Example: NX-OS switch ───────────────────────────────────────────────────
-  SW1:
-    alias: "%ENV{SW1_ALIAS}"
+  # ── IOS-XE core switch ──────────────────────────────────────────────────────
+  HMETC_CORE1:
+    alias: "HMETC Core Switch 1"
     type: "switch"
-    os: "%ENV{SW1_OS}"               # e.g. nxos  — or "generic" to autodetect
-    platform: "%ENV{SW1_PLATFORM}"   # e.g. n9k   — or ""
+    os: "%ENV{HMETC_CORE1_OS}"
+    platform: "%ENV{HMETC_CORE1_PLATFORM}"
     credentials:
       default:
-        username: "%ENV{SW1_USERNAME}"
-        password: "%ENV{SW1_PASSWORD}"
+        username: "%ENV{HMETC_CORE1_USERNAME}"
+        password: "%ENV{HMETC_CORE1_PASSWORD}"
       enable:
-        password: "%ENV{SW1_ENABLE_PASSWORD}"
+        password: "%ENV{HMETC_CORE1_ENABLE_PASSWORD}"
     connections:
       cli:
         protocol: ssh
-        ip: "%ENV{SW1_IP}"
-        port: "%ENV{SW1_PORT}"
+        ip: "%ENV{HMETC_CORE1_IP}"
+        port: "%ENV{HMETC_CORE1_PORT}"
         arguments:
           connection_timeout: 360
 
-  # ── Example: Linux host (no enable password needed) ─────────────────────────
-  LINUX1:
-    alias: "%ENV{LINUX1_ALIAS}"
-    type: "host"
-    os: "%ENV{LINUX1_OS}"            # linux  — or "generic" to autodetect
-    platform: "%ENV{LINUX1_PLATFORM}" # e.g. ubuntu — or ""
+  # ── Palo Alto firewall (no enable password) ──────────────────────────────────
+  EU_INT_FW1:
+    alias: "EU Internal Firewall 1"
+    type: "firewall"
+    os: "%ENV{EU_INT_FW1_OS}"
+    platform: "%ENV{EU_INT_FW1_PLATFORM}"
     credentials:
       default:
-        username: "%ENV{LINUX1_USERNAME}"
-        password: "%ENV{LINUX1_PASSWORD}"
+        username: "%ENV{EU_INT_FW1_USERNAME}"
+        password: "%ENV{EU_INT_FW1_PASSWORD}"
     connections:
       cli:
         protocol: ssh
-        ip: "%ENV{LINUX1_IP}"
-        port: "%ENV{LINUX1_PORT}"
+        ip: "%ENV{EU_INT_FW1_IP}"
+        port: "%ENV{EU_INT_FW1_PORT}"
         arguments:
           connection_timeout: 360
+
+  # ── Linux host (no enable password) ─────────────────────────────────────────
+  DESKTOP:
+    alias: "Ubuntu Desktop"
+    type: "host"
+    os: "%ENV{DESKTOP_OS}"
+    platform: "%ENV{DESKTOP_PLATFORM}"
+    credentials:
+      default:
+        username: "%ENV{DESKTOP_USERNAME}"
+        password: "%ENV{DESKTOP_PASSWORD}"
+    connections:
+      cli:
+        protocol: ssh
+        ip: "%ENV{DESKTOP_IP}"
+        port: "%ENV{DESKTOP_PORT}"
+        arguments:
+          connection_timeout: 360
+
+  # ── Unknown / autodetect device ──────────────────────────────────────────────
+  # Set UNKNOWN_SW_OS=generic in .env to let Unicon detect the OS automatically.
+  # UNKNOWN_SW:
+  #   alias: "Unknown Switch"
+  #   type: "switch"
+  #   os: "%ENV{UNKNOWN_SW_OS}"          # generic
+  #   platform: "%ENV{UNKNOWN_SW_PLATFORM}"  # blank
+  #   credentials:
+  #     default:
+  #       username: "%ENV{UNKNOWN_SW_USERNAME}"
+  #       password: "%ENV{UNKNOWN_SW_PASSWORD}"
+  #     enable:
+  #       password: "%ENV{UNKNOWN_SW_ENABLE_PASSWORD}"
+  #   connections:
+  #     cli:
+  #       protocol: ssh
+  #       ip: "%ENV{UNKNOWN_SW_IP}"
+  #       port: "%ENV{UNKNOWN_SW_PORT}"
+  #       arguments:
+  #         connection_timeout: 360
+  #         learn_os: true   # cache the detected OS after first connect
