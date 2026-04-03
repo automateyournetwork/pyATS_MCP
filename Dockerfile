@@ -40,12 +40,9 @@ RUN echo "==> Installing problematic dependencies separately..." \
         f5-icontrol-rest
 
 # Then install the main packages
+COPY requirements.txt .
 RUN echo "==> Installing pyATS and other Python packages..." \
-    && pip install --no-cache-dir \
-        pydantic \
-        python-dotenv \
-        fastmcp \
-        pyats[full]==25.2.0
+    && pip install --no-cache-dir -r requirements.txt
 
 # Copy your application code into the container's working directory
 COPY pyats_mcp_server.py .
