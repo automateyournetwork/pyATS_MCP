@@ -43,12 +43,11 @@ coverage.xml
 dmypy.json
 .pytype/
 
-# Environment / secrets
+# Environment / secrets — never commit these
 .env
 .env.local
 .env.*.local
-# Uncomment the following line to exclude testbed files from git:
-# testbed.yaml
+testbed.yaml
 
 # IDE
 .vscode/
