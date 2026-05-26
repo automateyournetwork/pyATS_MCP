@@ -90,6 +90,19 @@ _testbed_cache: Dict[str, Any] = {"loaded_at": 0.0, "tb": None}
 _CONN_CACHE_TTL: int = _parse_int_env("PYATS_MCP_CONN_CACHE_TTL", 0)
 _conn_cache: Dict[str, Dict[str, Any]] = {}
 
+# Connection defaults — these are used only when the testbed does NOT define a value
+# Set to empty string to disable the MCP default and use only testbed-defined values
+_DEFAULT_CONNECTION_TIMEOUT: Optional[int] = (
+    None if os.getenv("PYATS_MCP_CONNECTION_TIMEOUT", "") == ""
+    else _parse_int_env("PYATS_MCP_CONNECTION_TIMEOUT", 120)
+)
+_DEFAULT_LEARN_HOSTNAME: bool = os.getenv("PYATS_MCP_LEARN_HOSTNAME", "1") == "1"
+_DEFAULT_LOG_STDOUT: bool = os.getenv("PYATS_MCP_LOG_STDOUT", "0") == "1"
+_DEFAULT_MIT: Optional[bool] = (
+    None if os.getenv("PYATS_MCP_MIT", "") == ""
+    else os.getenv("PYATS_MCP_MIT", "1") == "1"
+)
+
 # In-memory operation log — survives for the lifetime of the server process
 _OP_LOG: List[Dict[str, Any]] = []
 _OP_LOG_MAX: int = _parse_int_env("PYATS_MCP_OP_LOG_MAX", 500)
@@ -174,6 +187,51 @@ def _load_testbed():
     return _testbed_cache["tb"]
 
 
+def _get_testbed_connection_args(device) -> Dict[str, Any]:
+    """
+    Extract connection arguments from the testbed device definition.
+
+    Checks both the default connection's 'arguments' block and the device-level
+    'custom.connection_args' for any user-defined connection settings such as:
+      - connection_timeout
+      - init_exec_commands
+      - init_config_commands
+      - mit
+      - etc.
+
+    These testbed-defined values take precedence over MCP defaults.
+    """
+    args: Dict[str, Any] = {}
+
+    # Check device-level custom.connection_args (less common but supported)
+    if hasattr(device, "custom") and isinstance(device.custom, dict):
+        custom_args = device.custom.get("connection_args", {})
+        if isinstance(custom_args, dict):
+            args.update(custom_args)
+
+    # Check the default connection's arguments block (most common location)
+    connections = getattr(device, "connections", {})
+    if connections:
+        # Try to find the default connection or first available
+        default_conn = connections.get("defaults", {})
+        if default_conn and hasattr(default_conn, "get"):
+            conn_args = default_conn.get("arguments", {})
+            if isinstance(conn_args, dict):
+                args.update(conn_args)
+
+        # Also check the primary connection (cli, ssh, etc.)
+        for conn_name in ("cli", "ssh", "telnet", "netconf", "rest", "a", "default"):
+            conn = connections.get(conn_name)
+            if conn and hasattr(conn, "__dict__"):
+                conn_dict = getattr(conn, "__dict__", {})
+                conn_args = conn_dict.get("arguments", {})
+                if isinstance(conn_args, dict):
+                    args.update(conn_args)
+                break
+
+    return args
+
+
 def _evict_expired_connections() -> None:
     """Disconnect and evict cache entries whose TTL has elapsed."""
     if _CONN_CACHE_TTL <= 0:
@@ -200,6 +258,15 @@ def _get_device(device_name: str):
 
     Raises ValueError if the device is not present in the testbed.
     Respects the connection cache when PYATS_MCP_CONN_CACHE_TTL > 0.
+
+    Connection arguments are merged in this priority order (highest wins):
+      1. Testbed-defined arguments (device's connection 'arguments' block)
+      2. MCP environment variable overrides (PYATS_MCP_CONNECTION_TIMEOUT, etc.)
+      3. MCP built-in defaults (learn_hostname=True, log_stdout=False)
+
+    To fully respect testbed settings, set PYATS_MCP_CONNECTION_TIMEOUT=""
+    and PYATS_MCP_MIT="" in your environment to disable MCP defaults for
+    those parameters.
     """
     tb = _load_testbed()
     device = tb.devices.get(device_name)
@@ -218,12 +285,27 @@ def _get_device(device_name: str):
 
     if not device.is_connected():
         logger.info("Connecting to %s …", device_name)
-        device.connect(
-            connection_timeout=120,
-            learn_hostname=True,
-            log_stdout=False,
-            mit=True,
-        )
+
+        # Start with MCP defaults (only for values that are set)
+        connect_args: Dict[str, Any] = {
+            "learn_hostname": _DEFAULT_LEARN_HOSTNAME,
+            "log_stdout": _DEFAULT_LOG_STDOUT,
+        }
+
+        # Add optional MCP defaults only if they are configured
+        if _DEFAULT_CONNECTION_TIMEOUT is not None:
+            connect_args["connection_timeout"] = _DEFAULT_CONNECTION_TIMEOUT
+        if _DEFAULT_MIT is not None:
+            connect_args["mit"] = _DEFAULT_MIT
+
+        # Merge in testbed-defined arguments (these take precedence)
+        testbed_args = _get_testbed_connection_args(device)
+        if testbed_args:
+            logger.debug("Merging testbed connection args for %s: %s", device_name, testbed_args)
+            connect_args.update(testbed_args)
+
+        logger.debug("Final connection args for %s: %s", device_name, connect_args)
+        device.connect(**connect_args)
         logger.info("Connected to %s", device_name)
 
     if _CONN_CACHE_TTL > 0:
