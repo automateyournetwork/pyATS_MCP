@@ -1,6 +1,9 @@
 # pyATS MCP Server
 [![Trust Score](https://archestra.ai/mcp-catalog/api/badge/quality/automateyournetwork/pyATS_MCP)](https://archestra.ai/mcp-catalog/automateyournetwork__pyats_mcp)
 
+[![Available on CodeGuilds](https://img.shields.io/badge/Available_on-CodeGuilds-6366f1)](https://codeguilds.dev/packages/pyats-mcp)
+
+
 MCP server that wraps Cisco pyATS and Genie, letting AI agents (Claude, LangGraph, etc.) run show commands, apply configuration, and query network state over STDIO using JSON-RPC 2.0.
 
 > All communication is via STDIN/STDOUT — no HTTP ports, no REST endpoints.
