@@ -44,6 +44,15 @@ COPY requirements.txt .
 RUN echo "==> Installing pyATS and other Python packages..." \
     && pip install --no-cache-dir -r requirements.txt
 
+# pyats[full]'s dependency resolution pulls in setuptools>=81, which removed
+# the pkg_resources module entirely. genie/unicon still import pkg_resources
+# at runtime, causing "ModuleNotFoundError: No module named 'pkg_resources'"
+# when the server starts. Pin to the last setuptools release that still
+# ships pkg_resources, installed last so nothing above it can upgrade it
+# again.
+RUN echo "==> Pinning setuptools<81 (last release shipping pkg_resources)..." \
+    && pip install --no-cache-dir --force-reinstall "setuptools<81"
+
 # Copy your application code into the container's working directory
 COPY pyats_mcp_server.py .
 
