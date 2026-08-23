@@ -1,0 +1,159 @@
+{
+  "connect_elapsed_s": 0.022679900000184716,
+  "url": "http://127.0.0.1:8098/mcp",
+  "client_mode": "legacy",
+  "results": {
+    "single_show_command": {
+      "status": "measured",
+      "tool": "pyats_run_show_command",
+      "samples": [
+        {
+          "elapsed_s": 15.735880969000391,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.710663476999798,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.668691482000213,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.560777006000535,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.712589285999456,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.744437491999633,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.601438184000472,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.79262923999977,
+          "ok": true
+        }
+      ]
+    },
+    "multi_show_thread_pool": {
+      "status": "measured",
+      "tool": "pyats_run_show_command_multi",
+      "samples": [
+        {
+          "elapsed_s": 15.619434729000204,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.685734296000192,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.986641202999635,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.649401048000072,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.890388222999718,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.853326383000422,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.71557699799996,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.717788987999484,
+          "ok": true
+        }
+      ]
+    },
+    "multi_show_pcall": {
+      "status": "measured",
+      "tool": "pyats_pcall_show_command",
+      "samples": [
+        {
+          "elapsed_s": 15.790600913000162,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.788438728000074,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.789600181999958,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.792548759000056,
+          "ok": true
+        },
+        {
+          "elapsed_s": 16.04115165099938,
+          "ok": true
+        },
+        {
+          "elapsed_s": 16.039068518999557,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.789361039000141,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.789480419000029,
+          "ok": true
+        }
+      ]
+    },
+    "device_health": {
+      "status": "measured",
+      "tool": "pyats_device_health",
+      "samples": [
+        {
+          "elapsed_s": 18.31510838899976,
+          "ok": true
+        },
+        {
+          "elapsed_s": 18.245451548000347,
+          "ok": true
+        },
+        {
+          "elapsed_s": 18.25605108599939,
+          "ok": true
+        },
+        {
+          "elapsed_s": 18.02466690000074,
+          "ok": true
+        },
+        {
+          "elapsed_s": 18.023924874999466,
+          "ok": true
+        },
+        {
+          "elapsed_s": 18.130755365999903,
+          "ok": true
+        },
+        {
+          "elapsed_s": 18.334656490999805,
+          "ok": true
+        },
+        {
+          "elapsed_s": 18.105562960999123,
+          "ok": true
+        }
+      ]
+    }
+  }
+}
