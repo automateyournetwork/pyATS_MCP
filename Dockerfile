@@ -2,7 +2,7 @@
 FROM python:3.10-slim
 
 LABEL maintainer="Your Name <you@example.com>"
-LABEL description="Docker image for pyATS MCP Server interacting via stdio"
+LABEL description="Docker image for pyATS MCP Server (Streamable HTTP)"
 
 # Install system dependencies required by pyATS, SSH, and your script
 # Combine update, install, and cleanup in one layer to optimize image size
@@ -58,6 +58,9 @@ COPY pyats_mcp_server.py .
 
 # Optional: If you have other files needed by the script (e.g., commands.json), copy them too
 # COPY commands.json .
+
+# Streamable HTTP — override PYATS_MCP_HTTP_PORT to change this
+EXPOSE 8080
 
 # Define the entrypoint to run your server script
 ENTRYPOINT ["python", "pyats_mcp_server.py"]

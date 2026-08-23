@@ -3,8 +3,8 @@
 pyats_mcp_server.py
 ===================
 MCP server that exposes Cisco pyATS / Genie functionality as structured tools
-for use by AI agents (Claude, LangGraph, etc.) over STDIO using the FastMCP
-JSON-RPC 2.0 transport.
+for use by AI agents (Claude, LangGraph, etc.) over Streamable HTTP JSON-RPC 2.0
+transport, in either stateful or stateless mode (see PYATS_MCP_TRANSPORT_MODE).
 
 Design principles
 -----------------
@@ -33,15 +33,21 @@ import string
 import subprocess
 import sys
 import textwrap
+import threading
 import time
+import zipfile
 from difflib import SequenceMatcher
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+import requests
+import yaml
 from dotenv import load_dotenv
 from genie.libs.parser.utils import get_parser
-from mcp.server.fastmcp import FastMCP
+from genie.utils.diff import Diff
+from mcp.server.mcpserver import MCPServer
+from pyats.async_ import pcall
 from pyats.topology import loader
 
 # ---------------------------------------------------------------------------
@@ -73,6 +79,11 @@ ARTIFACTS_DIR: Path = Path(
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
 KEEP_ARTIFACTS: bool = os.getenv("PYATS_MCP_KEEP_ARTIFACTS", "1") == "1"
+
+# XPresso REST API — optional; pyats_xpresso_request errors clearly if unset.
+XPRESSO_URL: str = os.getenv("XPRESSO_URL", "").rstrip("/")
+XPRESSO_API_TOKEN: str = os.getenv("XPRESSO_API_TOKEN", "")
+XPRESSO_GROUP: str = os.getenv("XPRESSO_GROUP", "")
 
 # Testbed re-load interval (seconds); avoids hammering disk on every call
 def _parse_int_env(var: str, default: int) -> int:
@@ -110,6 +121,24 @@ _OP_LOG_MAX: int = _parse_int_env("PYATS_MCP_OP_LOG_MAX", 500)
 # Pre-configure snapshots for rollback  { device_name -> running-config string }
 _config_snapshots: Dict[str, str] = {}
 
+# Genie "learn" snapshots for diffing  { "device:feature:label" -> learned dict }
+_learn_snapshots: Dict[str, Dict[str, Any]] = {}
+
+# ---------------------------------------------------------------------------
+# Concurrency
+#
+# Under the STDIO transport, tool calls from one client were the only source
+# of concurrency (multi-device fan-out via asyncio.gather). Under Streamable
+# HTTP — stateful or stateless — multiple clients can hit this process at
+# once, so every mutation of the process-global caches above (_testbed_cache,
+# _conn_cache, _config_snapshots, _learn_snapshots, _OP_LOG) must be
+# serialized. Blocking device I/O (connect/disconnect/execute) must NEVER
+# happen while holding this lock — only the dict reads/writes around it —
+# otherwise concurrent device fan-out would be serialized server-wide,
+# defeating the point of the thread pool.
+# ---------------------------------------------------------------------------
+_STATE_LOCK = threading.Lock()
+
 # ---------------------------------------------------------------------------
 # ANSI / non-printable stripping
 # ---------------------------------------------------------------------------
@@ -143,9 +172,10 @@ def _log_op(
     }
     if error:
         entry["error"] = error
-    _OP_LOG.append(entry)
-    if len(_OP_LOG) > _OP_LOG_MAX:
-        _OP_LOG.pop(0)
+    with _STATE_LOCK:
+        _OP_LOG.append(entry)
+        if len(_OP_LOG) > _OP_LOG_MAX:
+            _OP_LOG.pop(0)
 
 
 def _err(
@@ -180,11 +210,12 @@ def _err(
 
 def _load_testbed():
     """Return the cached testbed, reloading from disk when the TTL has expired."""
-    now = time.time()
-    if _testbed_cache["tb"] is None or (now - _testbed_cache["loaded_at"]) > _TESTBED_CACHE_TTL:
-        _testbed_cache["tb"] = loader.load(TESTBED_PATH)
-        _testbed_cache["loaded_at"] = now
-    return _testbed_cache["tb"]
+    with _STATE_LOCK:
+        now = time.time()
+        if _testbed_cache["tb"] is None or (now - _testbed_cache["loaded_at"]) > _TESTBED_CACHE_TTL:
+            _testbed_cache["tb"] = loader.load(TESTBED_PATH)
+            _testbed_cache["loaded_at"] = now
+        return _testbed_cache["tb"]
 
 
 def _get_testbed_connection_args(device) -> Dict[str, Any]:
@@ -237,19 +268,23 @@ def _evict_expired_connections() -> None:
     if _CONN_CACHE_TTL <= 0:
         return
     now = time.time()
-    expired = [
-        k for k, v in _conn_cache.items()
-        if (now - float(v.get("last_used", 0))) > _CONN_CACHE_TTL
-    ]
-    for name in expired:
-        dev = _conn_cache.get(name, {}).get("device")
+    # Snapshot-and-pop under the lock so a concurrent _get_device() call for
+    # the same device never observes a half-evicted entry; the actual
+    # dev.disconnect() I/O then happens outside the lock.
+    with _STATE_LOCK:
+        expired = [
+            k for k, v in _conn_cache.items()
+            if (now - float(v.get("last_used", 0))) > _CONN_CACHE_TTL
+        ]
+        expired_entries = [(k, _conn_cache.pop(k, None)) for k in expired]
+    for name, entry in expired_entries:
+        dev = (entry or {}).get("device")
         try:
             if dev and getattr(dev, "is_connected", lambda: False)():
                 logger.info("Connection cache TTL expired — disconnecting %s", name)
                 dev.disconnect()
         except Exception as e:
             logger.warning("Error disconnecting expired connection for %s: %s", name, e)
-        _conn_cache.pop(name, None)
 
 
 def _get_device(device_name: str):
@@ -278,10 +313,11 @@ def _get_device(device_name: str):
 
     if _CONN_CACHE_TTL > 0:
         _evict_expired_connections()
-        cached = _conn_cache.get(device_name, {}).get("device")
-        if cached and getattr(cached, "is_connected", lambda: False)():
-            _conn_cache[device_name]["last_used"] = time.time()
-            return cached
+        with _STATE_LOCK:
+            cached = _conn_cache.get(device_name, {}).get("device")
+            if cached and getattr(cached, "is_connected", lambda: False)():
+                _conn_cache[device_name]["last_used"] = time.time()
+                return cached
 
     if not device.is_connected():
         logger.info("Connecting to %s …", device_name)
@@ -309,7 +345,8 @@ def _get_device(device_name: str):
         logger.info("Connected to %s", device_name)
 
     if _CONN_CACHE_TTL > 0:
-        _conn_cache[device_name] = {"device": device, "last_used": time.time()}
+        with _STATE_LOCK:
+            _conn_cache[device_name] = {"device": device, "last_used": time.time()}
 
     return device
 
@@ -324,10 +361,10 @@ def _disconnect_device(device, force: bool = False) -> None:
     if not device:
         return
     if _CONN_CACHE_TTL > 0 and not force:
-        try:
-            _conn_cache[getattr(device, "name", "")]["last_used"] = time.time()
-        except KeyError:
-            pass
+        with _STATE_LOCK:
+            entry = _conn_cache.get(getattr(device, "name", ""))
+            if entry is not None:
+                entry["last_used"] = time.time()
         return
     if getattr(device, "is_connected", lambda: False)():
         try:
@@ -563,6 +600,32 @@ def _execute_health(device_name: str) -> Dict[str, Any]:
         _disconnect_device(device)
 
 
+def _execute_learn_feature(device_name: str, feature: str) -> Dict[str, Any]:
+    """
+    Run Genie's device.learn(feature) and return the learned Ops data.
+
+    Unlike pyats_run_show_command's per-command parsing, device.learn()
+    gathers and normalizes everything Genie knows about one feature (e.g.
+    'interface', 'ospf', 'bgp') across whatever show commands that feature's
+    Ops model needs, vendor-neutrally.
+    """
+    device = None
+    try:
+        device = _get_device(device_name)
+        ops = device.learn(feature)
+        learned = getattr(ops, "info", None)
+        if learned is None:
+            learned = {k: v for k, v in vars(ops).items() if not k.startswith("_")}
+        return {
+            "status": "completed", "device": device_name, "feature": feature,
+            "learned": learned,
+        }
+    except Exception as exc:
+        return {"status": "error", "device": device_name, "feature": feature, "error": str(exc)}
+    finally:
+        _disconnect_device(device)
+
+
 def _execute_get_neighbors(device_name: str) -> Dict[str, Any]:
     """
     Return a clean adjacency list from CDP or LLDP neighbor tables.
@@ -712,7 +775,8 @@ async def _apply_config_with_diff(
         )
 
     if save_snapshot:
-        _config_snapshots[device_name] = before
+        with _STATE_LOCK:
+            _config_snapshots[device_name] = before
 
     result = await apply_device_configuration_async(device_name, config_commands)
     if result.get("status") == "error":
@@ -776,6 +840,32 @@ def _extract_overall_result(stdout: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
+_ARCHIVE_LINE_RE = re.compile(r"Archive\s*:\s*(\S+\.zip)")
+
+
+def _extract_job_report(stdout: str) -> Dict[str, Any]:
+    """
+    Read the structured results.json out of the job's own archive zip.
+
+    There is no working `--json-job <path>` flag in this pyATS version —
+    it is silently accepted by the CLI's argument parser but never
+    produces a report file (verified). pyATS does, however, always
+    archive the run to a .zip under ~/.pyats/archive/ by default, and
+    that archive contains a real results.json — this reads that instead.
+    """
+    match = _ARCHIVE_LINE_RE.search(stdout or "")
+    if not match:
+        return {"report": None, "archive_path": None}
+    archive_path = match.group(1)
+    try:
+        with zipfile.ZipFile(archive_path) as zf:
+            report = json.loads(zf.read("results.json"))
+        return {"report": report, "archive_path": archive_path}
+    except Exception as exc:
+        logger.warning("Could not read results.json from archive %s: %s", archive_path, exc)
+        return {"report": None, "archive_path": archive_path}
+
+
 def _run_test_script(script_content: str, timeout_s: int = 300) -> Dict[str, Any]:
     """
     Write *script_content* to a temp directory, run it as a pyATS job, and
@@ -787,7 +877,6 @@ def _run_test_script(script_content: str, timeout_s: int = 300) -> Dict[str, Any
 
     script_path = run_dir / "testscript.py"
     job_path = run_dir / "job.py"
-    report_path = run_dir / "job_report.json"
 
     try:
         script_path.write_text(script_content, encoding="utf-8")
@@ -798,8 +887,7 @@ def _run_test_script(script_content: str, timeout_s: int = 300) -> Dict[str, Any
             encoding="utf-8",
         )
 
-        cmd = [shutil.which("pyats") or "pyats", "run", "job",
-               str(job_path), "--json-job", str(report_path)]
+        cmd = [shutil.which("pyats") or "pyats", "run", "job", str(job_path)]
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True,
@@ -811,13 +899,7 @@ def _run_test_script(script_content: str, timeout_s: int = 300) -> Dict[str, Any
                     "error": f"pyATS job timed out after {timeout_s}s",
                     "artifacts_dir": str(run_dir)}
 
-        report = None
-        if report_path.exists():
-            try:
-                raw = report_path.read_text(encoding="utf-8")
-                report = json.loads(raw) if raw.strip() else None
-            except Exception as exc:
-                logger.warning("Could not parse job report JSON: %s", exc)
+        report_info = _extract_job_report(proc.stdout)
 
         payload = {
             "status": "completed",
@@ -825,9 +907,12 @@ def _run_test_script(script_content: str, timeout_s: int = 300) -> Dict[str, Any
             "overall_result": _extract_overall_result(proc.stdout),
             "stdout": proc.stdout,
             "stderr": proc.stderr,
-            "report": report,
+            "report": report_info["report"],
             "artifacts_dir": str(run_dir),
-            "paths": {"script": str(script_path), "job": str(job_path), "report": str(report_path)},
+            "paths": {
+                "script": str(script_path), "job": str(job_path),
+                "archive": report_info["archive_path"],
+            },
         }
         if not KEEP_ARTIFACTS:
             shutil.rmtree(run_dir, ignore_errors=True)
@@ -840,7 +925,7 @@ def _run_test_script(script_content: str, timeout_s: int = 300) -> Dict[str, Any
 # ---------------------------------------------------------------------------
 # MCP server instance
 # ---------------------------------------------------------------------------
-mcp = FastMCP("pyATS Network Automation Server")
+mcp = MCPServer("pyATS Network Automation Server")
 
 
 # ===========================================================================
@@ -1066,6 +1151,78 @@ async def pyats_run_show_command_multi(device_names: List[str], command: str) ->
         return json.dumps(_err("pyats_run_show_command_multi", None, command, str(exc)), indent=2)
 
 
+def _pcall_show_command(device_names: List[str], command: str) -> List[Dict[str, Any]]:
+    """
+    Run _execute_show_raw once per device, each in its own forked OS process
+    via pyats.async_.pcall — a process-isolated alternative to the thread
+    pool used by pyats_run_show_command_multi.
+
+    Each child process is a fork() of this one, so it starts with its own
+    private copy of _testbed_cache / _conn_cache / _STATE_LOCK (fork gives
+    every child independent memory — nothing it does propagates back to the
+    parent). It always connects and disconnects fresh; it never reuses a
+    connection from the parent's _conn_cache. Prefer this over the
+    thread-pool version for very large device counts where true OS-level
+    isolation (one process crashing can't affect another) matters more than
+    the extra fork overhead.
+    """
+    results = pcall(_execute_show_raw, iargs=[(name, command) for name in device_names])
+    return list(results)
+
+
+@mcp.tool()
+async def pyats_pcall_show_command(device_names: List[str], command: str) -> str:
+    """
+    Run ONE show command across MULTIPLE devices, each in its own OS process
+    (pyats.async_.pcall) rather than a shared thread pool.
+
+    WHEN TO USE:
+      Prefer pyats_run_show_command_multi for everyday fan-out — it has far
+      less overhead. Reach for this tool instead when you specifically want
+      process-level isolation across a large device count (e.g. a parser
+      crash or a runaway command on one device cannot affect any other,
+      since each device runs in its own forked process, not a shared
+      thread pool).
+
+    Args:
+        device_names: List of exact device names.
+        command:      Show command to run on every device (same rules as
+                      pyats_run_show_command — must start with 'show').
+
+    Returns:
+        {
+          "status": "completed",
+          "command": "show ip bgp summary",
+          "concurrency": "pcall (process per device)",
+          "summary": {"total": 3, "success": 2, "failed": 1},
+          "results": [ {per-device result}, ... ]
+        }
+    """
+    if not device_names:
+        return json.dumps(_err("pyats_pcall_show_command", None, command,
+                               "device_names is empty.",
+                               "Call pyats_list_devices to get valid names."), indent=2)
+    err = validate_show_command(command)
+    if err:
+        return json.dumps(_err("pyats_pcall_show_command", None, command, err), indent=2)
+
+    try:
+        results: List[Dict[str, Any]] = await _run_in_executor(_pcall_show_command, device_names, command)
+        success = sum(1 for r in results if r.get("status") == "completed")
+        for r in results:
+            _log_op("pyats_pcall_show_command", r.get("device"), command,
+                    r.get("status", "error"), r.get("error"))
+        return json.dumps({
+            "status": "completed", "command": command,
+            "concurrency": "pcall (process per device)",
+            "summary": {"total": len(results), "success": success, "failed": len(results) - success},
+            "results": results,
+        }, indent=2)
+    except Exception as exc:
+        logger.error("pyats_pcall_show_command failed: %s", exc, exc_info=True)
+        return json.dumps(_err("pyats_pcall_show_command", None, command, str(exc)), indent=2)
+
+
 @mcp.tool()
 async def pyats_show_running_config(device_name: str) -> str:
     """
@@ -1173,6 +1330,104 @@ async def pyats_device_health(device_name: str) -> str:
     except Exception as exc:
         logger.error("pyats_device_health failed: %s", exc, exc_info=True)
         return json.dumps(_err("pyats_device_health", device_name, None, str(exc)), indent=2)
+
+
+@mcp.tool()
+async def pyats_learn_feature(
+    device_name: str,
+    feature: str,
+    snapshot_label: Optional[str] = None,
+) -> str:
+    """
+    Run Genie's device.learn(feature) and optionally save the result as a
+    named snapshot for later comparison with pyats_diff_learned_snapshots.
+
+    WHEN TO USE:
+      Use for a vendor-neutral, structured view of an entire feature (e.g.
+      'interface', 'ospf', 'bgp', 'routing', 'platform') rather than parsing
+      individual show commands one at a time. Also the first half of a
+      before/after comparison — call once before a change with
+      snapshot_label="before", again after with snapshot_label="after",
+      then pyats_diff_learned_snapshots("before", "after").
+
+    Args:
+        device_name:    Exact device name.
+        feature:        Genie feature name (e.g. "interface", "ospf", "bgp").
+        snapshot_label: If given, store this learn result under this label
+                        for this device+feature so it can be diffed later.
+                        Labels are process-global and overwrite any prior
+                        snapshot with the same device+feature+label.
+
+    Returns:
+        { "status": "completed", "device": "...", "feature": "ospf",
+          "learned": {...}, "snapshot_saved": "before" }
+    """
+    try:
+        result = await _run_in_executor(_execute_learn_feature, device_name, feature)
+        if result.get("status") == "completed" and snapshot_label:
+            with _STATE_LOCK:
+                _learn_snapshots[f"{device_name}:{feature}:{snapshot_label}"] = result["learned"]
+            result["snapshot_saved"] = snapshot_label
+        _log_op("pyats_learn_feature", device_name, feature,
+                result.get("status", "error"), result.get("error"))
+        return json.dumps(result, indent=2)
+    except Exception as exc:
+        logger.error("pyats_learn_feature failed: %s", exc, exc_info=True)
+        return json.dumps(_err("pyats_learn_feature", device_name, feature, str(exc)), indent=2)
+
+
+@mcp.tool()
+async def pyats_diff_learned_snapshots(
+    device_name: str,
+    feature: str,
+    label_a: str,
+    label_b: str,
+) -> str:
+    """
+    Compare two previously saved pyats_learn_feature snapshots for one
+    device+feature and return a unified diff.
+
+    PRECONDITION:
+      Both snapshots must already exist — call pyats_learn_feature twice
+      first, once per label, for the same device_name and feature.
+
+    Args:
+        device_name: Exact device name.
+        feature:     Genie feature name — must match what was learned.
+        label_a:     Label of the "before" snapshot.
+        label_b:     Label of the "after" snapshot.
+
+    Returns:
+        { "status": "completed", "device": "...", "feature": "ospf",
+          "diff": "  neighbors:\\n-  10.0.0.1: up\\n+  10.0.0.1: down" }
+      diff is empty string if the two snapshots are identical.
+    """
+    key_a = f"{device_name}:{feature}:{label_a}"
+    key_b = f"{device_name}:{feature}:{label_b}"
+    with _STATE_LOCK:
+        snap_a = _learn_snapshots.get(key_a)
+        snap_b = _learn_snapshots.get(key_b)
+
+    missing = [lbl for lbl, snap in ((label_a, snap_a), (label_b, snap_b)) if snap is None]
+    if missing:
+        return json.dumps(_err(
+            "pyats_diff_learned_snapshots", device_name, feature,
+            f"No snapshot found for label(s): {', '.join(missing)}.",
+            "Call pyats_learn_feature with snapshot_label set for each label first.",
+        ), indent=2)
+
+    try:
+        diff = Diff(snap_a, snap_b)
+        diff.findDiff()
+        diff_text = str(diff)
+        _log_op("pyats_diff_learned_snapshots", device_name, f"{feature}:{label_a}->{label_b}", "completed")
+        return json.dumps({
+            "status": "completed", "device": device_name, "feature": feature,
+            "label_a": label_a, "label_b": label_b, "diff": diff_text,
+        }, indent=2)
+    except Exception as exc:
+        logger.error("pyats_diff_learned_snapshots failed: %s", exc, exc_info=True)
+        return json.dumps(_err("pyats_diff_learned_snapshots", device_name, feature, str(exc)), indent=2)
 
 
 @mcp.tool()
@@ -1486,15 +1741,16 @@ async def pyats_rollback_config(device_name: str) -> str:
     AFTER ROLLBACK:
       Confirm success with pyats_show_running_config or pyats_device_health.
     """
-    if device_name not in _config_snapshots:
+    with _STATE_LOCK:
+        snapshot = _config_snapshots.get(device_name)
+
+    if snapshot is None:
         return json.dumps(_err(
             "pyats_rollback_config", device_name, None,
             f"No rollback snapshot found for '{device_name}'.",
             "Snapshots are saved automatically by pyats_configure_with_diff. "
             "If you used pyats_configure_device no snapshot was created.",
         ), indent=2)
-
-    snapshot = _config_snapshots[device_name]
     # Strip comment lines before re-applying
     lines = [l for l in snapshot.splitlines() if l.strip() and not l.strip().startswith("!")]
 
@@ -1568,6 +1824,370 @@ async def pyats_configure_devices_multi(
         return json.dumps(_err("pyats_configure_devices_multi", None, None, str(exc)), indent=2)
 
 
+def _pcall_configure_devices(device_names: List[str], config_commands: Any) -> List[Dict[str, Any]]:
+    """Process-isolated sibling of pyats_configure_devices_multi — see _pcall_show_command."""
+    results = pcall(_execute_config, iargs=[(name, config_commands) for name in device_names])
+    return list(results)
+
+
+@mcp.tool()
+async def pyats_pcall_configure_devices(
+    device_names: List[str],
+    config_commands: Any,
+) -> str:
+    """
+    Push the SAME configuration to MULTIPLE devices, each in its own OS
+    process (pyats.async_.pcall) rather than a shared thread pool.
+
+    WHEN TO USE:
+      Same use case as pyats_configure_devices_multi (uniform fleet-wide
+      config push) — reach for this variant instead when you want process-
+      level isolation across a large device count, at the cost of fork
+      overhead per device. Guardrails (_config_guardrails) still apply
+      identically inside each child process.
+
+    Args:
+        device_names:    List of exact device names.
+        config_commands: Config payload applied identically to all devices.
+                         Same format rules as pyats_configure_device.
+
+    Returns:
+        {
+          "status": "completed",
+          "concurrency": "pcall (process per device)",
+          "summary": {"total": 3, "success": 2, "failed": 1},
+          "results": [ {per-device result}, ... ]
+        }
+    """
+    if not device_names:
+        return json.dumps(_err("pyats_pcall_configure_devices", None, None,
+                               "device_names is empty.",
+                               "Call pyats_list_devices to get valid names."), indent=2)
+    try:
+        results: List[Dict[str, Any]] = await _run_in_executor(
+            _pcall_configure_devices, device_names, config_commands
+        )
+        success = sum(1 for r in results if r.get("status") == "success")
+        for r in results:
+            _log_op("pyats_pcall_configure_devices", r.get("device"),
+                    str(config_commands)[:80], r.get("status", "error"), r.get("error"))
+        return json.dumps({
+            "status": "completed",
+            "concurrency": "pcall (process per device)",
+            "summary": {"total": len(results), "success": success, "failed": len(results) - success},
+            "results": results,
+        }, indent=2)
+    except Exception as exc:
+        logger.error("pyats_pcall_configure_devices failed: %s", exc, exc_info=True)
+        return json.dumps(_err("pyats_pcall_configure_devices", None, None, str(exc)), indent=2)
+
+
+# ===========================================================================
+# REST / RESTCONF TOOL
+#
+# Separate from the CLI/SSH tools above — uses pyATS's rest.connector.Rest
+# instead of Unicon. Requires the testbed device to define its own 'rest'
+# connection block (class: rest.connector.Rest); does NOT reuse _get_device
+# / _conn_cache, which are Unicon/CLI-specific. RESTCONF's connect() is a
+# no-op per the connector's own docs (no real handshake), so there is no
+# connection-caching complexity to add here — each call just reuses
+# device.rest's underlying requests.Session if already connected, or
+# connects once on first use.
+# ===========================================================================
+_REST_METHODS: frozenset = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
+
+
+def _get_rest_device(device_name: str):
+    """Return device.rest, connecting via the testbed's 'rest' alias if needed."""
+    tb = _load_testbed()
+    device = tb.devices.get(device_name)
+    if not device:
+        raise ValueError(
+            f"Device '{device_name}' not found in testbed. "
+            "Use pyats_list_devices or pyats_search_devices to find valid names."
+        )
+    connections = getattr(device, "connections", {}) or {}
+    if "rest" not in connections:
+        raise ValueError(
+            f"Device '{device_name}' has no 'rest' connection block in the testbed. "
+            "Add connections.rest with class: rest.connector.Rest (see README)."
+        )
+    conn = getattr(device, "rest", None)
+    if conn is None or not getattr(conn, "connected", False):
+        device.connect(alias="rest", via="rest")
+    return device.rest
+
+
+def _execute_rest_request(
+    device_name: str,
+    method: str,
+    api_url: str,
+    payload: Optional[str] = None,
+    content_type: Optional[str] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 30,
+) -> Dict[str, Any]:
+    method_u = (method or "").upper()
+    if method_u not in _REST_METHODS:
+        return {"status": "error", "device": device_name, "method": method, "api_url": api_url,
+                "error": f"Unsupported method '{method}'. Use one of {sorted(_REST_METHODS)}."}
+    try:
+        rest = _get_rest_device(device_name)
+        kwargs: Dict[str, Any] = {"timeout": timeout}
+        if content_type:
+            kwargs["content_type"] = content_type
+        if headers:
+            kwargs["headers"] = headers
+
+        if method_u == "GET":
+            resp = rest.get(api_url, **kwargs)
+        elif method_u == "DELETE":
+            resp = rest.delete(api_url, **kwargs)
+        else:
+            fn = {"POST": rest.post, "PUT": rest.put, "PATCH": rest.patch}[method_u]
+            resp = fn(api_url, payload=payload or "", **kwargs)
+
+        body_text = resp.text
+        try:
+            body: Any = json.loads(body_text) if body_text else None
+        except ValueError:
+            body = body_text
+
+        return {
+            "status": "completed", "device": device_name, "method": method_u, "api_url": api_url,
+            "status_code": resp.status_code, "body": body,
+        }
+    except Exception as exc:
+        return {"status": "error", "device": device_name, "method": method_u, "api_url": api_url,
+                "error": str(exc)}
+
+
+@mcp.tool()
+async def pyats_rest_request(
+    device_name: str,
+    method: str,
+    api_url: str,
+    payload: Optional[str] = None,
+    content_type: Optional[str] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 30,
+) -> str:
+    """
+    Make a generic REST/RESTCONF API call against a device using pyATS's
+    REST connector, for devices or controllers better automated over a
+    REST API than the CLI (RESTCONF on IOS-XE, NX-API on NX-OS, or any
+    other generic JSON/XML REST endpoint pyATS's rest.connector supports).
+
+    PRECONDITION:
+      The device's testbed entry must define a 'rest' connection block:
+        connections:
+          rest:
+            class: rest.connector.Rest
+            ip: <address>
+            port: "443"
+            protocol: https
+            credentials:
+              rest:
+                username: ...
+                password: ...
+
+    Args:
+        device_name:  Exact device name (must have a 'rest' connection block).
+        method:       One of GET, POST, PUT, PATCH, DELETE.
+        api_url:      Path portion of the URL, e.g.
+                      "/restconf/data/ietf-interfaces:interfaces".
+        payload:      JSON/XML body string for POST/PUT/PATCH (ignored for
+                      GET/DELETE).
+        content_type: "json" or "xml" (defaults to the connector's default).
+        headers:      Extra HTTP headers as a dict.
+        timeout:      Request timeout in seconds (default 30).
+
+    Returns:
+        { "status": "completed", "device": "...", "method": "GET",
+          "api_url": "...", "status_code": 200, "body": {...} }
+    """
+    if not (device_name or "").strip():
+        return json.dumps(_err("pyats_rest_request", device_name, api_url, "device_name is empty."), indent=2)
+    if not (api_url or "").strip():
+        return json.dumps(_err("pyats_rest_request", device_name, api_url, "api_url is empty."), indent=2)
+    try:
+        result = await _run_in_executor(
+            _execute_rest_request, device_name, method, api_url, payload, content_type, headers, timeout
+        )
+        _log_op("pyats_rest_request", device_name, f"{method} {api_url}",
+                result.get("status", "error"), result.get("error"))
+        return json.dumps(result, indent=2)
+    except Exception as exc:
+        logger.error("pyats_rest_request failed: %s", exc, exc_info=True)
+        return json.dumps(_err("pyats_rest_request", device_name, api_url, str(exc)), indent=2)
+
+
+# ===========================================================================
+# DEVICE CLEAN TOOL (Genie / Kleenex)
+#
+# Genie's clean/Kleenex engine has no supported public in-process API — the
+# DeviceClean class is an internal implementation detail tightly coupled to
+# pyats.aetest's global executer state, normally driven only by the `pyats
+# clean` CLI. That CLI *is* a fully supported entry point, so this tool
+# shells out to it (subprocess, timeout-bounded) rather than reaching into
+# genie.libs.clean internals directly.
+#
+# Genie's real clean stage catalog (ChangeBootVariable, Reload, WriteErase,
+# InstallImage, CopyToDevice, ...) is inherently destructive — that is the
+# point of "clean" (staged device reset/reprovisioning). This tool does not
+# expose those stages. It only ever generates a clean.yaml with the
+# 'connect' and 'execute_command' stages (schema confirmed against the
+# installed genie.libs.clean package's own test fixtures), so the worst
+# this tool can do is run read/exec-style commands on the device through
+# the clean framework — the same commands are still screened by
+# _config_guardrails. dry_run defaults to True, and running for real
+# requires an explicit literal confirm string.
+# ===========================================================================
+_CLEAN_CONFIRM_PHRASE = "I UNDERSTAND THIS IS A REAL DEVICE OPERATION"
+
+
+def _build_clean_yaml(device_name: str, commands: List[str]) -> str:
+    """Build a minimal, non-destructive clean.yaml (connect + execute_command only)."""
+    doc = {
+        "cleaners": {
+            "DeviceClean": {
+                "module": "genie.libs.clean",
+                "devices": [device_name],
+            },
+        },
+        "devices": {
+            device_name: {
+                "connect": None,
+                "execute_command": {"commands": commands},
+                "order": ["connect", "execute_command"],
+            },
+        },
+    }
+    return yaml.safe_dump(doc, sort_keys=False)
+
+
+def _execute_clean_device(
+    device_name: str, commands: List[str], timeout_s: int = 300
+) -> Dict[str, Any]:
+    """Write the generated clean.yaml and run `pyats clean` against it."""
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    run_dir = ARTIFACTS_DIR / f"clean_{ts}_{os.getpid()}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    clean_path = run_dir / "clean.yaml"
+
+    try:
+        clean_yaml = _build_clean_yaml(device_name, commands)
+        clean_path.write_text(clean_yaml, encoding="utf-8")
+
+        cmd = [
+            shutil.which("pyats") or "pyats", "clean",
+            "--testbed-file", TESTBED_PATH,
+            "--clean-file", str(clean_path),
+            "--clean-devices", device_name,
+            "--no-mail",
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            return {"status": "error", "device": device_name,
+                    "error": f"pyats clean timed out after {timeout_s}s",
+                    "clean_yaml": clean_yaml, "artifacts_dir": str(run_dir)}
+
+        payload = {
+            "status": "completed" if proc.returncode == 0 else "error",
+            "device": device_name,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "clean_yaml": clean_yaml,
+            "artifacts_dir": str(run_dir),
+        }
+        if proc.returncode != 0:
+            payload["error"] = f"pyats clean exited with code {proc.returncode}"
+        if not KEEP_ARTIFACTS:
+            shutil.rmtree(run_dir, ignore_errors=True)
+        return payload
+    except Exception as exc:
+        logger.error("_execute_clean_device failed: %s", exc, exc_info=True)
+        return {"status": "error", "device": device_name, "error": str(exc), "artifacts_dir": str(run_dir)}
+
+
+@mcp.tool()
+async def pyats_clean_device(
+    device_name: str,
+    commands: List[str],
+    dry_run: bool = True,
+    confirm: Optional[str] = None,
+) -> str:
+    """
+    Run a conservative Genie Clean (Kleenex) stage sequence against a device:
+    connect, then execute a list of commands. Real Genie clean stages that
+    reboot, erase, or reimage a device are NOT exposed by this tool — only
+    'connect' + 'execute_command' are ever generated.
+
+    WHEN TO USE:
+      Use to validate the Genie clean/Kleenex pipeline itself (testbed
+      wiring, clean-file schema, CLI invocation) against a real device
+      without risking a reload or config wipe — e.g. as a smoke test before
+      trusting clean in a bigger workflow, or to run a batch of commands
+      through the clean framework specifically (as opposed to
+      pyats_run_show_command, which does not use Kleenex at all).
+
+    SAFETY:
+      - dry_run=True (default): returns the generated clean.yaml and does
+        NOT touch the device or spawn any subprocess.
+      - dry_run=False: requires confirm to exactly equal
+        "I UNDERSTAND THIS IS A REAL DEVICE OPERATION", then shells out to
+        `pyats clean` for real. Commands are still screened by the same
+        guardrails as pyats_configure_device (reload/erase/delete/format
+        are blocked).
+
+    Args:
+        device_name: Exact device name.
+        commands:    List of commands to run via the clean execute_command
+                     stage (e.g. ["show version", "show boot"]).
+        dry_run:     If True (default), only generate and return the
+                     clean.yaml — no device contact.
+        confirm:     Required literal string when dry_run=False:
+                     "I UNDERSTAND THIS IS A REAL DEVICE OPERATION"
+
+    Returns:
+        { "status": "completed", "device": "...", "returncode": 0,
+          "stdout": "...", "clean_yaml": "...", "artifacts_dir": "..." }
+    """
+    if not commands:
+        return json.dumps(_err("pyats_clean_device", device_name, None,
+                               "commands is empty."), indent=2)
+    guard = _config_guardrails(commands)
+    if guard:
+        return json.dumps(_err("pyats_clean_device", device_name, None, guard), indent=2)
+
+    if dry_run:
+        clean_yaml = _build_clean_yaml(device_name, commands)
+        _log_op("pyats_clean_device", device_name, "dry_run", "completed")
+        return json.dumps({
+            "status": "completed", "device": device_name, "dry_run": True,
+            "clean_yaml": clean_yaml,
+            "message": "Dry run only — no subprocess spawned, device not contacted.",
+        }, indent=2)
+
+    if confirm != _CLEAN_CONFIRM_PHRASE:
+        return json.dumps(_err(
+            "pyats_clean_device", device_name, None,
+            "confirm did not match the required phrase.",
+            f"Pass confirm=\"{_CLEAN_CONFIRM_PHRASE}\" to run for real, or leave dry_run=True.",
+        ), indent=2)
+
+    try:
+        result = await _run_in_executor(_execute_clean_device, device_name, commands, 300)
+        _log_op("pyats_clean_device", device_name, "clean_execute_command",
+                result.get("status", "error"), result.get("error"))
+        return json.dumps(result, indent=2)
+    except Exception as exc:
+        logger.error("pyats_clean_device failed: %s", exc, exc_info=True)
+        return json.dumps(_err("pyats_clean_device", device_name, None, str(exc)), indent=2)
+
+
 # ===========================================================================
 # TESTING TOOL
 # ===========================================================================
@@ -1616,6 +2236,413 @@ async def pyats_run_dynamic_test(test_script_content: str) -> str:
 
 
 # ===========================================================================
+# DECLARATIVE TEST TOOL (pyATS Blitz)
+#
+# Blitz (genie.libs.sdk.triggers.blitz.blitz.Blitz) has no supported
+# in-process API — its class imports the global pyats.easypy.runtime
+# singleton, so like Genie clean it must run inside a real job/easypy
+# runner. This tool generates a trigger datafile + job file and shells out
+# to `pyats run job`, the same subprocess-with-timeout shape as
+# pyats_run_dynamic_test/_run_test_script above — including the structured
+# report, read via _extract_job_report() from the job's own archive zip
+# rather than the CLI's `--json-job` flag (verified dead: silently
+# accepted, never produces a report file in this pyATS version).
+# ===========================================================================
+_BLITZ_TRIGGER_NAME = "PyatsMcpBlitz"
+
+
+def _blitz_guardrails(actions_yaml: str) -> Optional[str]:
+    """Best-effort denylist scan over raw blitz YAML text, same spirit as _config_guardrails."""
+    lowered = (actions_yaml or "").lower()
+    dangerous = [
+        (r"\bwrite\s+erase\b", "write erase"),
+        (r"\breload\b", "reload"),
+        (r"\berase\b", "erase"),
+        (r"\bformat\b", "format"),
+    ]
+    for pattern, label in dangerous:
+        if re.search(pattern, lowered, flags=re.MULTILINE):
+            return f"Dangerous command detected in blitz actions: '{label}'. Operation aborted."
+    return None
+
+
+def _build_scoped_testbed(device_names: List[str], run_dir: Path) -> str:
+    """
+    Write a trimmed copy of the real testbed containing only *device_names*.
+
+    genie.harness's common_setup (used by `pyats run job`) connects to
+    EVERY device in whatever testbed it's given, not just the ones a
+    specific trigger targets — so a full-testbed run fails outright the
+    moment any device in the testbed (even one this call doesn't care
+    about) is unreachable. Scoping the testbed file itself is the fix.
+
+    Any %ENV{...} placeholders are left untouched (this is a plain YAML
+    read/filter/write, not a pyats.topology.loader.load() — substitution
+    still happens normally when the scoped file is loaded by the
+    subprocess, which inherits this process's environment).
+    """
+    with open(TESTBED_PATH, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    all_devices = raw.get("devices", {}) or {}
+    raw["devices"] = {name: all_devices[name] for name in device_names if name in all_devices}
+    scoped_path = run_dir / "scoped_testbed.yaml"
+    scoped_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    return str(scoped_path)
+
+
+def _run_blitz(actions_yaml: str, device_names: List[str], timeout_s: int = 300) -> Dict[str, Any]:
+    """
+    Wrap *actions_yaml* (a YAML list matching Blitz's test_sections schema)
+    into a trigger datafile and run it via `pyats run job` + genie.harness's
+    gRun, against a testbed scoped to just *device_names*.
+    """
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    run_dir = ARTIFACTS_DIR / f"blitz_{ts}_{os.getpid()}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    trigger_path = run_dir / "trigger_datafile.yaml"
+    job_path = run_dir / "blitz_job.py"
+
+    try:
+        try:
+            sections = yaml.safe_load(actions_yaml)
+        except Exception as exc:
+            return {"status": "error", "error": f"actions_yaml is not valid YAML: {exc}",
+                    "artifacts_dir": str(run_dir)}
+        if not isinstance(sections, list):
+            return {"status": "error",
+                    "error": "actions_yaml must parse to a YAML list (Blitz test_sections).",
+                    "artifacts_dir": str(run_dir)}
+
+        trigger_doc = {
+            _BLITZ_TRIGGER_NAME: {
+                "source": {"pkg": "genie.libs.sdk", "class": "triggers.blitz.blitz.Blitz"},
+                "devices": device_names,
+                "test_sections": sections,
+            },
+        }
+        trigger_path.write_text(yaml.safe_dump(trigger_doc, sort_keys=False), encoding="utf-8")
+        job_path.write_text(
+            "from genie.harness.main import gRun\n"
+            "def main(runtime):\n"
+            f"    gRun(trigger_datafile=r'{trigger_path}', trigger_uids=['{_BLITZ_TRIGGER_NAME}'])\n",
+            encoding="utf-8",
+        )
+        scoped_testbed_path = _build_scoped_testbed(device_names, run_dir)
+
+        cmd = [shutil.which("pyats") or "pyats", "run", "job", str(job_path),
+               "--testbed-file", scoped_testbed_path, "--no-mail"]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            return {"status": "error", "error": f"blitz job timed out after {timeout_s}s",
+                    "artifacts_dir": str(run_dir)}
+
+        report_info = _extract_job_report(proc.stdout)
+        payload = {
+            "status": "completed",
+            "returncode": proc.returncode,
+            "overall_result": _extract_overall_result(proc.stdout),
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "report": report_info["report"],
+            "trigger_datafile": str(trigger_path),
+            "archive": report_info["archive_path"],
+            "artifacts_dir": str(run_dir),
+        }
+        if not KEEP_ARTIFACTS:
+            shutil.rmtree(run_dir, ignore_errors=True)
+        return payload
+    except Exception as exc:
+        logger.error("_run_blitz failed: %s", exc, exc_info=True)
+        return {"status": "error", "error": str(exc), "artifacts_dir": str(run_dir)}
+
+
+@mcp.tool()
+async def pyats_run_blitz(actions_yaml: str, device_names: List[str]) -> str:
+    """
+    Run a declarative pyATS Blitz test against one or more devices.
+
+    WHEN TO USE:
+      Multi-step, declarative device workflows (execute, configure, parse,
+      learn, and more, chained across named steps) expressed as data rather
+      than code — e.g. "run show version, then configure an ACL, then
+      verify it applied." For pure PASS/FAIL logic over already-known data
+      use pyats_run_dynamic_test instead; for one ad-hoc command use
+      pyats_run_show_command.
+
+    Args:
+        actions_yaml: YAML text for Blitz's test_sections — a list of named
+                      steps, each a list of actions. Example:
+                        - step1:
+                          - execute:
+                              device: R1
+                              command: show version
+        device_names: Devices this blitz trigger runs against (the
+                      trigger's top-level 'devices:' list).
+
+    Returns:
+        { "status": "completed", "overall_result": "PASSED|FAILED",
+          "returncode": 0, "stdout": "...", "stderr": "...",
+          "trigger_datafile": "/path/...", "artifacts_dir": "..." }
+    """
+    if not (actions_yaml or "").strip():
+        return json.dumps(_err("pyats_run_blitz", None, None, "actions_yaml is empty."), indent=2)
+    if not device_names:
+        return json.dumps(_err("pyats_run_blitz", None, None,
+                               "device_names is empty.",
+                               "Call pyats_list_devices to get valid names."), indent=2)
+    guard = _blitz_guardrails(actions_yaml)
+    if guard:
+        return json.dumps(_err("pyats_run_blitz", None, None, guard), indent=2)
+
+    try:
+        result = await _run_in_executor(_run_blitz, actions_yaml, device_names, 300)
+        _log_op("pyats_run_blitz", ",".join(device_names), "blitz",
+                result.get("status", "error"), result.get("error"))
+        return json.dumps(result, indent=2)
+    except Exception as exc:
+        logger.error("pyats_run_blitz failed: %s", exc, exc_info=True)
+        return json.dumps(_err("pyats_run_blitz", None, None, str(exc)), indent=2)
+
+
+# ===========================================================================
+# ROBOT FRAMEWORK TOOL
+#
+# This pyATS version has no `pyats robot` CLI subcommand — pyats.robot and
+# genie.libs.robot are Robot Framework *libraries*, imported from inside
+# the .robot suite itself (verified installed: robotframework 7.4.2,
+# pyats.robot.pyATSRobot, genie.libs.robot.GenieRobot). So this tool runs
+# the suite via the standalone `robot` CLI (subprocess, timeout-bounded),
+# the same shape as the other external-runner tools above. Keyword syntax
+# below is confirmed against the installed libraries' @keyword decorators,
+# not guessed: 'Use Testbed "${testbed}"', 'Connect To Device "${device}"',
+# 'Parse "${parser}" on device "${device}"', 'Learn "${feature}" on device
+# "${device}"'.
+# ===========================================================================
+
+def _robot_guardrails(script: str) -> Optional[str]:
+    """Best-effort denylist scan over raw Robot script text, same spirit as _config_guardrails."""
+    lowered = (script or "").lower()
+    dangerous = [
+        (r"\bwrite\s+erase\b", "write erase"),
+        (r"\breload\b", "reload"),
+        (r"\berase\b", "erase"),
+        (r"\bformat\b", "format"),
+    ]
+    for pattern, label in dangerous:
+        if re.search(pattern, lowered, flags=re.MULTILINE):
+            return f"Dangerous command detected in robot script: '{label}'. Operation aborted."
+    return None
+
+
+def _run_robot_script(script_content: str, timeout_s: int = 300) -> Dict[str, Any]:
+    """
+    Write *script_content* to a .robot file — substituting the literal
+    token {{TESTBED_PATH}} with this server's real, absolute testbed
+    path — and run it via the `robot` CLI.
+    """
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    run_dir = ARTIFACTS_DIR / f"robot_{ts}_{os.getpid()}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    suite_path = run_dir / "suite.robot"
+
+    try:
+        rendered = script_content.replace("{{TESTBED_PATH}}", TESTBED_PATH)
+        suite_path.write_text(rendered, encoding="utf-8")
+
+        cmd = [shutil.which("robot") or "robot", "--outputdir", str(run_dir), str(suite_path)]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            return {"status": "error", "error": f"robot run timed out after {timeout_s}s",
+                    "artifacts_dir": str(run_dir)}
+
+        payload = {
+            "status": "completed",
+            "overall_result": "PASSED" if proc.returncode == 0 else "FAILED",
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "artifacts_dir": str(run_dir),
+            "paths": {
+                "suite": str(suite_path),
+                "output_xml": str(run_dir / "output.xml"),
+                "log_html": str(run_dir / "log.html"),
+                "report_html": str(run_dir / "report.html"),
+            },
+        }
+        if not KEEP_ARTIFACTS:
+            shutil.rmtree(run_dir, ignore_errors=True)
+        return payload
+    except Exception as exc:
+        logger.error("_run_robot_script failed: %s", exc, exc_info=True)
+        return {"status": "error", "error": str(exc), "artifacts_dir": str(run_dir)}
+
+
+@mcp.tool()
+async def pyats_run_robot(robot_script_content: str) -> str:
+    """
+    Run a Robot Framework test suite with pyATS/Genie keyword libraries
+    against the real testbed.
+
+    WHEN TO USE:
+      Keyword-driven, non-Python test suites — a good fit if your team
+      already standardizes on Robot Framework for authoring/reporting.
+      For Python logic use pyats_run_dynamic_test; for declarative YAML
+      actions use pyats_run_blitz.
+
+    HOW IT WORKS:
+      Writes robot_script_content to a .robot file and runs it via the
+      standalone `robot` CLI (subprocess, timeout-bounded). Example
+      suite content:
+
+        *** Settings ***
+        Library    pyats.robot.pyATSRobot
+        Library    genie.libs.robot.GenieRobot
+
+        *** Test Cases ***
+        Check Version
+            Use Testbed "{{TESTBED_PATH}}"
+            Connect To Device "R1"
+            ${result}=    Parse "show version" on device "R1"
+            Disconnect From Device "R1"
+
+      The literal token {{TESTBED_PATH}} is substituted with this
+      server's real, absolute testbed path before the suite runs — you
+      never need to know or hard-code that path yourself.
+
+      IMPORTANT — Robot's embedded-argument keywords (Use Testbed "...",
+      Connect To Device "...", Parse "..." on device "...", etc.) must
+      have exactly ONE space before each quoted part, not the usual
+      multi-space/tab column separator — extra spaces make Robot split
+      it into a bogus multi-cell call and fail with "No keyword with
+      name '...' found" (verified against the installed library).
+
+    Args:
+        robot_script_content: Complete .robot suite text (Settings +
+                              Test Cases sections).
+
+    Returns:
+        { "status": "completed", "overall_result": "PASSED|FAILED",
+          "returncode": 0, "stdout": "...", "stderr": "...",
+          "artifacts_dir": "...", "paths": {"output_xml": "...", ...} }
+    """
+    if not (robot_script_content or "").strip():
+        return json.dumps(_err("pyats_run_robot", None, None, "robot_script_content is empty."), indent=2)
+    guard = _robot_guardrails(robot_script_content)
+    if guard:
+        return json.dumps(_err("pyats_run_robot", None, None, guard), indent=2)
+    try:
+        result = await _run_in_executor(_run_robot_script, robot_script_content, 300)
+        _log_op("pyats_run_robot", None, "robot_suite",
+                result.get("status", "error"), result.get("error"))
+        return json.dumps(result, indent=2)
+    except Exception as exc:
+        logger.error("pyats_run_robot failed: %s", exc, exc_info=True)
+        return json.dumps(_err("pyats_run_robot", None, None, str(exc)), indent=2)
+
+
+# ===========================================================================
+# XPRESSO REST API TOOL
+#
+# CAUTION — UNVERIFIED: built directly from Cisco's published XPresso REST
+# API v2 documentation (Authorization: Jwt <token> + Group: <name> headers,
+# offset/limit pagination), but not exercised against a live XPresso
+# instance — none was available while writing this tool. Treat the first
+# real call against your XPresso server as the actual verification step,
+# and expect to adjust header/path details if your instance's behavior
+# differs from the published docs.
+# ===========================================================================
+
+_XPRESSO_METHODS: frozenset = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
+
+
+def _execute_xpresso_request(
+    method: str,
+    path: str,
+    payload: Optional[Dict[str, Any]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: int = 30,
+) -> Dict[str, Any]:
+    if not XPRESSO_URL or not XPRESSO_API_TOKEN or not XPRESSO_GROUP:
+        return {"status": "error",
+                "error": "XPresso is not configured — set XPRESSO_URL, XPRESSO_API_TOKEN, "
+                         "and XPRESSO_GROUP in .env."}
+    method_u = (method or "").upper()
+    if method_u not in _XPRESSO_METHODS:
+        return {"status": "error",
+                "error": f"Unsupported method '{method}'. Use one of {sorted(_XPRESSO_METHODS)}."}
+
+    url = f"{XPRESSO_URL}{path if path.startswith('/') else '/' + path}"
+    headers = {
+        "Authorization": f"Jwt {XPRESSO_API_TOKEN}",
+        "Group": XPRESSO_GROUP,
+    }
+    try:
+        resp = requests.request(
+            method_u, url, headers=headers, params=params,
+            json=payload if payload is not None else None, timeout=timeout,
+        )
+        try:
+            body: Any = resp.json()
+        except ValueError:
+            body = resp.text
+        return {
+            "status": "completed", "method": method_u, "url": url,
+            "status_code": resp.status_code, "body": body,
+        }
+    except Exception as exc:
+        return {"status": "error", "method": method_u, "url": url, "error": str(exc)}
+
+
+@mcp.tool()
+async def pyats_xpresso_request(
+    method: str,
+    path: str,
+    payload: Optional[Dict[str, Any]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: int = 30,
+) -> str:
+    """
+    Make an authenticated call to Cisco XPresso's REST API v2 (test
+    request/bundle submission and retrieval, job/bundle/profile lookup,
+    lab equipment — testbeds, clean instructions, topologies — test
+    harness/execution engine lookup, and image retrieval/pull/build).
+
+    UNVERIFIED: built from XPresso's published REST API v2 docs, not
+    tested against a live instance. Validate your first real call
+    carefully.
+
+    PRECONDITION:
+      Set in .env: XPRESSO_URL (e.g. https://xpresso.example.com),
+      XPRESSO_API_TOKEN (your API automation token, from XPresso's
+      Profile > API Token menu), XPRESSO_GROUP (your XPresso group name).
+
+    Args:
+        method:  One of GET, POST, PUT, PATCH, DELETE.
+        path:    API path, e.g. "/api/v2/testbeds" or "/api/v2/requests".
+        payload: JSON body dict for POST/PUT/PATCH (ignored for GET/DELETE).
+        params:  Query-string params dict — XPresso list/search endpoints
+                 use offset/limit pagination, e.g. {"offset": 50, "limit": 100}.
+        timeout: Request timeout in seconds (default 30).
+
+    Returns:
+        { "status": "completed", "method": "GET", "url": "...",
+          "status_code": 200, "body": {...} }
+    """
+    if not (path or "").strip():
+        return json.dumps(_err("pyats_xpresso_request", None, path, "path is empty."), indent=2)
+    try:
+        result = await _run_in_executor(_execute_xpresso_request, method, path, payload, params, timeout)
+        _log_op("pyats_xpresso_request", None, f"{method} {path}",
+                result.get("status", "error"), result.get("error"))
+        return json.dumps(result, indent=2)
+    except Exception as exc:
+        logger.error("pyats_xpresso_request failed: %s", exc, exc_info=True)
+        return json.dumps(_err("pyats_xpresso_request", None, path, str(exc)), indent=2)
+
+
+# ===========================================================================
 # SESSION / AUDIT TOOL
 # ===========================================================================
 
@@ -1660,13 +2687,15 @@ async def pyats_get_operation_log(
       At the start of a long session call this tool to check what was already
       investigated and avoid redundant round-trips.
     """
-    entries = _OP_LOG[:]
+    with _STATE_LOCK:
+        entries = _OP_LOG[:]
+        total_entries = len(_OP_LOG)
     if device_filter:
         entries = [e for e in entries if e.get("device") == device_filter]
     entries = entries[-min(limit, _OP_LOG_MAX):]
     return json.dumps({
         "status": "completed",
-        "total_entries": len(_OP_LOG),
+        "total_entries": total_entries,
         "returned": len(entries),
         "filter_device": device_filter,
         "log": entries,
@@ -1675,7 +2704,36 @@ async def pyats_get_operation_log(
 
 # ---------------------------------------------------------------------------
 # Entry point
+#
+# Streamable HTTP only (STDIO removed). PYATS_MCP_TRANSPORT_MODE selects:
+#   stateful  (default) — stateless_http=False, server retains HTTP-session
+#                          state for clients still on the pre-SEP-2575 (legacy
+#                          2025-06-18) handshake-based protocol.
+#   stateless           — stateless_http=True, no HTTP-session state kept
+#                          between requests even for legacy-protocol clients.
+# Clients speaking the current 2026-07-28 protocol core are handshake-free
+# and per-request-metadata-based regardless of this flag — that behavior
+# comes from the mcp>=2.0.0 SDK itself, not from anything configured here.
 # ---------------------------------------------------------------------------
+_TRANSPORT_MODE: str = os.getenv("PYATS_MCP_TRANSPORT_MODE", "stateful").strip().lower()
+if _TRANSPORT_MODE not in ("stateful", "stateless"):
+    logger.warning(
+        "Invalid PYATS_MCP_TRANSPORT_MODE=%r; defaulting to 'stateful'", _TRANSPORT_MODE
+    )
+    _TRANSPORT_MODE = "stateful"
+
+_HTTP_HOST: str = os.getenv("PYATS_MCP_HTTP_HOST", "0.0.0.0")
+_HTTP_PORT: int = _parse_int_env("PYATS_MCP_HTTP_PORT", 8080)
+
 if __name__ == "__main__":
-    logger.info("Starting pyATS MCP Server …")
-    mcp.run()
+    logger.info(
+        "Starting pyATS MCP Server — transport=streamable-http mode=%s host=%s port=%d",
+        _TRANSPORT_MODE, _HTTP_HOST, _HTTP_PORT,
+    )
+    mcp.run(
+        transport="streamable-http",
+        host=_HTTP_HOST,
+        port=_HTTP_PORT,
+        json_response=True,
+        stateless_http=(_TRANSPORT_MODE == "stateless"),
+    )

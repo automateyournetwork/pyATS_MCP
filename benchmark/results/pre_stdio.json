@@ -1,0 +1,124 @@
+{
+  "connect_elapsed_s": 1.0738944029999402,
+  "transport": "stdio",
+  "results": {
+    "single_show_command": {
+      "status": "measured",
+      "tool": "pyats_run_show_command",
+      "samples": [
+        {
+          "elapsed_s": 15.704244989000472,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.580602553999597,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.74998827699983,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.618781468000634,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.783668192999357,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.836366129999988,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.600703296000574,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.651756891999867,
+          "ok": true
+        }
+      ]
+    },
+    "multi_show_thread_pool": {
+      "status": "measured",
+      "tool": "pyats_run_show_command_multi",
+      "samples": [
+        {
+          "elapsed_s": 15.709723917000701,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.668899286999476,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.721330246999969,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.667635101999622,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.876240689000042,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.737459560000389,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.839642153999193,
+          "ok": true
+        },
+        {
+          "elapsed_s": 15.904995643000802,
+          "ok": true
+        }
+      ]
+    },
+    "multi_show_pcall": {
+      "status": "not_available",
+      "tool": "pyats_pcall_show_command"
+    },
+    "device_health": {
+      "status": "measured",
+      "tool": "pyats_device_health",
+      "samples": [
+        {
+          "elapsed_s": 18.156922978000694,
+          "ok": true
+        },
+        {
+          "elapsed_s": 17.97760865300006,
+          "ok": true
+        },
+        {
+          "elapsed_s": 18.14438724899992,
+          "ok": true
+        },
+        {
+          "elapsed_s": 17.976643930000137,
+          "ok": true
+        },
+        {
+          "elapsed_s": 18.131227167999896,
+          "ok": true
+        },
+        {
+          "elapsed_s": 17.96071306199974,
+          "ok": true
+        },
+        {
+          "elapsed_s": 18.14891914600048,
+          "ok": true
+        },
+        {
+          "elapsed_s": 17.965435961000367,
+          "ok": true
+        }
+      ]
+    }
+  }
+}

@@ -34,13 +34,16 @@ def _make_stub_modules():
         "dotenv": types.ModuleType("dotenv"),
         "pyats": types.ModuleType("pyats"),
         "pyats.topology": types.ModuleType("pyats.topology"),
+        "pyats.async_": types.ModuleType("pyats.async_"),
         "genie": types.ModuleType("genie"),
         "genie.libs": types.ModuleType("genie.libs"),
         "genie.libs.parser": types.ModuleType("genie.libs.parser"),
         "genie.libs.parser.utils": types.ModuleType("genie.libs.parser.utils"),
+        "genie.utils": types.ModuleType("genie.utils"),
+        "genie.utils.diff": types.ModuleType("genie.utils.diff"),
         "mcp": types.ModuleType("mcp"),
         "mcp.server": types.ModuleType("mcp.server"),
-        "mcp.server.fastmcp": types.ModuleType("mcp.server.fastmcp"),
+        "mcp.server.mcpserver": types.ModuleType("mcp.server.mcpserver"),
     }
 
     # dotenv
@@ -50,21 +53,28 @@ def _make_stub_modules():
     mock_loader = MagicMock()
     stubs["pyats.topology"].loader = mock_loader  # type: ignore[attr-defined]
 
+    # pyats.async_.pcall — real tests patch srv._pcall_show_command /
+    # srv._pcall_configure_devices directly, so this stub only needs to exist.
+    stubs["pyats.async_"].pcall = MagicMock()  # type: ignore[attr-defined]
+
     # genie parser utility
     stubs["genie.libs.parser.utils"].get_parser = MagicMock(return_value=None)  # type: ignore[attr-defined]
 
-    # FastMCP stub — decorators become no-ops that return the original function
-    class _FakeFastMCP:
+    # genie.utils.diff.Diff — real tests patch srv.Diff directly when needed.
+    stubs["genie.utils.diff"].Diff = MagicMock()  # type: ignore[attr-defined]
+
+    # MCPServer stub — decorators become no-ops that return the original function
+    class _FakeMCPServer:
         def __init__(self, *args, **kwargs):
             pass
         def tool(self):
             def decorator(fn):
                 return fn
             return decorator
-        def run(self):
+        def run(self, *args, **kwargs):
             pass
 
-    stubs["mcp.server.fastmcp"].FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    stubs["mcp.server.mcpserver"].MCPServer = _FakeMCPServer  # type: ignore[attr-defined]
 
     for name, mod in stubs.items():
         sys.modules.setdefault(name, mod)
@@ -88,8 +98,8 @@ def _json(result: str) -> dict:
 
 
 def _run(coro):
-    """Run a coroutine synchronously (Python < 3.11 compatible)."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    """Run a coroutine synchronously."""
+    return asyncio.run(coro)
 
 
 def _mock_device(name: str = "router-1", connected: bool = True) -> MagicMock:
@@ -821,6 +831,302 @@ class TestNormalizeConfigEdgeCases(unittest.TestCase):
         for wrapper in ["configure terminal", "conf t", "config t", "configure t", "end"]:
             result = fn([wrapper, "ntp server 1.1.1.1"])
             assert wrapper not in result
+
+
+# ---------------------------------------------------------------------------
+# New tools: pcall, learn/diff, clean, blitz, robot, rest, xpresso
+# ---------------------------------------------------------------------------
+
+class TestPyatsPcallShowCommand(unittest.TestCase):
+    def setUp(self):
+        srv._OP_LOG.clear()
+
+    def test_runs_across_all_devices(self):
+        canned = [
+            {"status": "completed", "device": "r1", "command": "show version", "output": "ok"},
+            {"status": "completed", "device": "r2", "command": "show version", "output": "ok"},
+        ]
+        with patch.object(srv, "_pcall_show_command", return_value=canned):
+            result = _json(_run(srv.pyats_pcall_show_command(["r1", "r2"], "show version")))
+        assert result["status"] == "completed"
+        assert result["concurrency"] == "pcall (process per device)"
+        assert result["summary"] == {"total": 2, "success": 2, "failed": 0}
+
+    def test_empty_device_list_returns_error(self):
+        result = _json(_run(srv.pyats_pcall_show_command([], "show version")))
+        assert result["status"] == "error"
+
+    def test_invalid_command_returns_error(self):
+        result = _json(_run(srv.pyats_pcall_show_command(["r1"], "reload")))
+        assert result["status"] == "error"
+
+    def test_partial_failure_reflected_in_summary(self):
+        canned = [
+            {"status": "completed", "device": "r1", "command": "show version", "output": "ok"},
+            {"status": "error", "device": "r2", "error": "timeout"},
+        ]
+        with patch.object(srv, "_pcall_show_command", return_value=canned):
+            result = _json(_run(srv.pyats_pcall_show_command(["r1", "r2"], "show version")))
+        assert result["summary"] == {"total": 2, "success": 1, "failed": 1}
+
+
+class TestPyatsPcallConfigureDevices(unittest.TestCase):
+    def setUp(self):
+        srv._OP_LOG.clear()
+
+    def test_configures_all_devices(self):
+        canned = [
+            {"status": "success", "device": "r1", "commands_applied": ["ntp server 1.1.1.1"]},
+            {"status": "success", "device": "r2", "commands_applied": ["ntp server 1.1.1.1"]},
+        ]
+        with patch.object(srv, "_pcall_configure_devices", return_value=canned):
+            result = _json(_run(
+                srv.pyats_pcall_configure_devices(["r1", "r2"], ["ntp server 1.1.1.1"])
+            ))
+        assert result["concurrency"] == "pcall (process per device)"
+        assert result["summary"] == {"total": 2, "success": 2, "failed": 0}
+
+    def test_empty_device_list_returns_error(self):
+        result = _json(_run(srv.pyats_pcall_configure_devices([], ["ntp server 1.1.1.1"])))
+        assert result["status"] == "error"
+
+
+class TestPyatsLearnFeature(unittest.TestCase):
+    def setUp(self):
+        srv._OP_LOG.clear()
+        srv._learn_snapshots.clear()
+
+    def test_learn_without_snapshot(self):
+        learned = {"status": "completed", "device": "r1", "feature": "interface",
+                   "learned": {"Gi0/0": {"oper_status": "up"}}}
+        with patch.object(srv, "_execute_learn_feature", return_value=learned):
+            result = _json(_run(srv.pyats_learn_feature("r1", "interface")))
+        assert result["status"] == "completed"
+        assert "snapshot_saved" not in result
+        assert srv._learn_snapshots == {}
+
+    def test_learn_with_snapshot_label_saves_it(self):
+        learned = {"status": "completed", "device": "r1", "feature": "interface",
+                   "learned": {"Gi0/0": {"oper_status": "up"}}}
+        with patch.object(srv, "_execute_learn_feature", return_value=learned):
+            result = _json(_run(srv.pyats_learn_feature("r1", "interface", "baseline")))
+        assert result["snapshot_saved"] == "baseline"
+        assert srv._learn_snapshots["r1:interface:baseline"] == learned["learned"]
+
+    def test_error_result_not_saved_as_snapshot(self):
+        errored = {"status": "error", "device": "r1", "feature": "interface", "error": "conn fail"}
+        with patch.object(srv, "_execute_learn_feature", return_value=errored):
+            result = _json(_run(srv.pyats_learn_feature("r1", "interface", "baseline")))
+        assert result["status"] == "error"
+        assert srv._learn_snapshots == {}
+
+
+class TestPyatsDiffLearnedSnapshots(unittest.TestCase):
+    def setUp(self):
+        srv._OP_LOG.clear()
+        srv._learn_snapshots.clear()
+
+    def test_missing_snapshot_returns_error(self):
+        result = _json(_run(
+            srv.pyats_diff_learned_snapshots("r1", "interface", "before", "after")
+        ))
+        assert result["status"] == "error"
+        assert "before" in result["error"] and "after" in result["error"]
+
+    def test_diff_of_two_snapshots(self):
+        srv._learn_snapshots["r1:interface:before"] = {"Gi0/0": {"status": "up"}}
+        srv._learn_snapshots["r1:interface:after"] = {"Gi0/0": {"status": "down"}}
+        with patch.object(srv, "Diff") as mock_diff_cls:
+            mock_diff = MagicMock()
+            mock_diff.__str__.return_value = "- status: up\n+ status: down"
+            mock_diff_cls.return_value = mock_diff
+            result = _json(_run(
+                srv.pyats_diff_learned_snapshots("r1", "interface", "before", "after")
+            ))
+        assert result["status"] == "completed"
+        assert "down" in result["diff"]
+        mock_diff.findDiff.assert_called_once()
+
+
+class TestBlitzGuardrails(unittest.TestCase):
+    def test_allows_safe_actions(self):
+        assert srv._blitz_guardrails("- step1:\n  - execute:\n      command: show version\n") is None
+
+    def test_blocks_reload(self):
+        assert srv._blitz_guardrails("- step1:\n  - execute:\n      command: reload\n") is not None
+
+    def test_blocks_write_erase(self):
+        assert srv._blitz_guardrails("command: write erase") is not None
+
+
+class TestPyatsRunBlitz(unittest.TestCase):
+    def setUp(self):
+        srv._OP_LOG.clear()
+
+    def test_empty_actions_yaml_returns_error(self):
+        result = _json(_run(srv.pyats_run_blitz("", ["r1"])))
+        assert result["status"] == "error"
+
+    def test_empty_device_list_returns_error(self):
+        result = _json(_run(srv.pyats_run_blitz("- step1:\n  - execute:\n      command: show version\n", [])))
+        assert result["status"] == "error"
+
+    def test_dangerous_action_blocked(self):
+        result = _json(_run(srv.pyats_run_blitz("command: reload", ["r1"])))
+        assert result["status"] == "error"
+
+    def test_success_path(self):
+        mock_result = {"status": "completed", "returncode": 0, "overall_result": "PASSED",
+                       "stdout": "", "stderr": "", "report": None,
+                       "trigger_datafile": "/tmp/t.yaml", "archive": None,
+                       "artifacts_dir": "/tmp/run"}
+        with patch.object(srv, "_run_blitz", return_value=mock_result):
+            result = _json(_run(
+                srv.pyats_run_blitz("- step1:\n  - execute:\n      command: show version\n", ["r1"])
+            ))
+        assert result["overall_result"] == "PASSED"
+
+
+class TestRobotGuardrails(unittest.TestCase):
+    def test_allows_safe_script(self):
+        assert srv._robot_guardrails('Connect To Device "R1"') is None
+
+    def test_blocks_reload(self):
+        assert srv._robot_guardrails("Execute Command    reload") is not None
+
+
+class TestPyatsRunRobot(unittest.TestCase):
+    def setUp(self):
+        srv._OP_LOG.clear()
+
+    def test_empty_script_returns_error(self):
+        result = _json(_run(srv.pyats_run_robot("")))
+        assert result["status"] == "error"
+
+    def test_dangerous_script_blocked(self):
+        result = _json(_run(srv.pyats_run_robot("Execute Command    erase startup-config")))
+        assert result["status"] == "error"
+
+    def test_success_path(self):
+        mock_result = {"status": "completed", "overall_result": "PASSED", "returncode": 0,
+                       "stdout": "1 test, 1 passed, 0 failed", "stderr": "",
+                       "artifacts_dir": "/tmp/run", "paths": {}}
+        with patch.object(srv, "_run_robot_script", return_value=mock_result):
+            result = _json(_run(srv.pyats_run_robot("*** Test Cases ***\nT1\n    No Operation\n")))
+        assert result["overall_result"] == "PASSED"
+
+
+class TestPyatsCleanDevice(unittest.TestCase):
+    def setUp(self):
+        srv._OP_LOG.clear()
+
+    def test_empty_commands_returns_error(self):
+        result = _json(_run(srv.pyats_clean_device("r1", [])))
+        assert result["status"] == "error"
+
+    def test_dangerous_command_blocked(self):
+        result = _json(_run(srv.pyats_clean_device("r1", ["reload"])))
+        assert result["status"] == "error"
+
+    def test_dry_run_returns_yaml_without_subprocess(self):
+        with patch.object(srv, "_execute_clean_device") as mock_exec:
+            result = _json(_run(srv.pyats_clean_device("r1", ["show version"])))
+        mock_exec.assert_not_called()
+        assert result["status"] == "completed"
+        assert result["dry_run"] is True
+        assert "execute_command" in result["clean_yaml"]
+
+    def test_real_run_requires_confirm_phrase(self):
+        result = _json(_run(
+            srv.pyats_clean_device("r1", ["show version"], dry_run=False, confirm="nope")
+        ))
+        assert result["status"] == "error"
+
+    def test_real_run_with_correct_confirm(self):
+        mock_result = {"status": "completed", "device": "r1", "returncode": 0,
+                       "stdout": "", "stderr": "", "clean_yaml": "...", "artifacts_dir": "/tmp/run"}
+        with patch.object(srv, "_execute_clean_device", return_value=mock_result) as mock_exec:
+            result = _json(_run(srv.pyats_clean_device(
+                "r1", ["show version"], dry_run=False, confirm=srv._CLEAN_CONFIRM_PHRASE,
+            )))
+        mock_exec.assert_called_once()
+        assert result["status"] == "completed"
+
+
+class TestPyatsRestRequest(unittest.TestCase):
+    def setUp(self):
+        srv._OP_LOG.clear()
+
+    def test_no_rest_block_returns_clean_error(self):
+        dev = _mock_device("r1")  # connections has no "rest" key
+        tb = MagicMock()
+        tb.devices = {"r1": dev}
+        with patch.object(srv, "_load_testbed", return_value=tb):
+            result = _json(_run(srv.pyats_rest_request("r1", "GET", "/restconf/data/x")))
+        assert result["status"] == "error"
+        assert "rest" in result["error"].lower()
+
+    def test_unsupported_method_returns_error(self):
+        dev = _mock_device("r1")
+        dev.connections = {"rest": MagicMock()}
+        tb = MagicMock()
+        tb.devices = {"r1": dev}
+        with patch.object(srv, "_load_testbed", return_value=tb):
+            result = _json(_run(srv.pyats_rest_request("r1", "TRACE", "/restconf/data/x")))
+        assert result["status"] == "error"
+
+    def test_get_success(self):
+        dev = _mock_device("r1")
+        dev.connections = {"rest": MagicMock()}
+        dev.rest = MagicMock()
+        dev.rest.connected = True
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.text = '{"ietf-interfaces:interfaces": {}}'
+        dev.rest.get.return_value = resp
+        tb = MagicMock()
+        tb.devices = {"r1": dev}
+        with patch.object(srv, "_load_testbed", return_value=tb):
+            result = _json(_run(
+                srv.pyats_rest_request("r1", "GET", "/restconf/data/ietf-interfaces:interfaces")
+            ))
+        assert result["status"] == "completed"
+        assert result["status_code"] == 200
+        assert result["body"] == {"ietf-interfaces:interfaces": {}}
+
+
+class TestPyatsXpressoRequest(unittest.TestCase):
+    def setUp(self):
+        srv._OP_LOG.clear()
+        self._url, self._token, self._group = srv.XPRESSO_URL, srv.XPRESSO_API_TOKEN, srv.XPRESSO_GROUP
+
+    def tearDown(self):
+        srv.XPRESSO_URL, srv.XPRESSO_API_TOKEN, srv.XPRESSO_GROUP = self._url, self._token, self._group
+
+    def test_not_configured_returns_clear_error(self):
+        srv.XPRESSO_URL, srv.XPRESSO_API_TOKEN, srv.XPRESSO_GROUP = "", "", ""
+        result = _json(_run(srv.pyats_xpresso_request("GET", "/api/v2/testbeds")))
+        assert result["status"] == "error"
+        assert "XPRESSO_URL" in result["error"]
+
+    def test_empty_path_returns_error(self):
+        result = _json(_run(srv.pyats_xpresso_request("GET", "")))
+        assert result["status"] == "error"
+
+    def test_get_success(self):
+        srv.XPRESSO_URL, srv.XPRESSO_API_TOKEN, srv.XPRESSO_GROUP = (
+            "https://xpresso.example.com", "tok123", "mygroup",
+        )
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"items": []}
+        with patch.object(srv.requests, "request", return_value=resp) as mock_req:
+            result = _json(_run(srv.pyats_xpresso_request("GET", "/api/v2/testbeds")))
+        assert result["status"] == "completed"
+        assert result["status_code"] == 200
+        called_headers = mock_req.call_args.kwargs["headers"]
+        assert called_headers["Authorization"] == "Jwt tok123"
+        assert called_headers["Group"] == "mygroup"
 
 
 # ---------------------------------------------------------------------------
