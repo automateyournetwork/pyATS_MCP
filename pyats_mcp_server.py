@@ -600,6 +600,28 @@ def _execute_health(device_name: str) -> Dict[str, Any]:
         _disconnect_device(device)
 
 
+def _to_jsonable(obj: Any) -> Any:
+    """
+    Recursively strip *obj* down to something json.dumps can serialize.
+
+    Genie Ops objects (and their vars()/__dict__ fallbacks) can hold live
+    references alongside the plain data — e.g. a 'device' key pointing at
+    the actual Device instance, or a bound method used as a callback. Those
+    aren't useful to the caller anyway, so rather than trust every attribute
+    to be JSON-safe, walk the structure and replace anything that isn't a
+    plain value/dict/list with a short string representation.
+    """
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_jsonable(v) for v in obj]
+    if callable(obj):
+        return f"<unserializable {type(obj).__name__}: {getattr(obj, '__name__', str(obj))}>"
+    return str(obj)
+
+
 def _execute_learn_feature(device_name: str, feature: str) -> Dict[str, Any]:
     """
     Run Genie's device.learn(feature) and return the learned Ops data.
@@ -616,6 +638,7 @@ def _execute_learn_feature(device_name: str, feature: str) -> Dict[str, Any]:
         learned = getattr(ops, "info", None)
         if learned is None:
             learned = {k: v for k, v in vars(ops).items() if not k.startswith("_")}
+        learned = _to_jsonable(learned)
         return {
             "status": "completed", "device": device_name, "feature": feature,
             "learned": learned,
