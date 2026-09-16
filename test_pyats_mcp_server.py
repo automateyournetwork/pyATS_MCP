@@ -891,6 +891,66 @@ class TestPyatsPcallConfigureDevices(unittest.TestCase):
         assert result["status"] == "error"
 
 
+class TestToJsonable(unittest.TestCase):
+    def test_passes_through_primitives_and_containers(self):
+        value = {"a": 1, "b": [1, "x", None, True], "c": {"nested": 2.5}}
+        assert srv._to_jsonable(value) == value
+        json.dumps(srv._to_jsonable(value))  # must not raise
+
+    def test_stringifies_bound_method(self):
+        class Fake:
+            def learn(self):
+                pass
+        obj = Fake()
+        result = srv._to_jsonable({"callback": obj.learn})
+        json.dumps(result)  # must not raise
+        assert "learn" in result["callback"]
+
+    def test_stringifies_arbitrary_object(self):
+        class Device:
+            def __repr__(self):
+                return "<Device R1>"
+        result = srv._to_jsonable({"device": Device(), "ok": "value"})
+        assert result == {"device": "<Device R1>", "ok": "value"}
+        json.dumps(result)  # must not raise
+
+    def test_handles_sets_and_tuples(self):
+        result = srv._to_jsonable({"a": (1, 2), "b": {3, 4}})
+        assert sorted(result["a"]) == [1, 2]
+        assert sorted(result["b"]) == [3, 4]
+        json.dumps(result)  # must not raise
+
+
+class TestExecuteLearnFeature(unittest.TestCase):
+    def test_vars_fallback_sanitizes_unserializable_attributes(self):
+        class FakeDevice:
+            def __repr__(self):
+                return "<Device R1>"
+
+        class FakeOps:
+            info = None  # forces the vars() fallback path
+
+            def __init__(self):
+                self.device = FakeDevice()
+                self.callback = self.learn
+                self.interfaces = {"Gi0/0": {"oper_status": "up"}}
+
+            def learn(self):
+                pass
+
+        dev = MagicMock()
+        dev.learn.return_value = FakeOps()
+        with patch.object(srv, "_get_device", return_value=dev):
+            with patch.object(srv, "_disconnect_device"):
+                result = srv._execute_learn_feature("r1", "interface")
+
+        assert result["status"] == "completed"
+        json.dumps(result)  # must not raise — this reproduces the prior crash
+        assert result["learned"]["interfaces"] == {"Gi0/0": {"oper_status": "up"}}
+        assert result["learned"]["device"] == "<Device R1>"
+        assert "learn" in result["learned"]["callback"]
+
+
 class TestPyatsLearnFeature(unittest.TestCase):
     def setUp(self):
         srv._OP_LOG.clear()
