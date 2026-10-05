@@ -10,6 +10,7 @@ full initialize/session handshake, one connection for the whole run
 Usage:
     .venv-pre/bin/python benchmark/_run_stdio_pre.py <server_py_path> <testbed_yaml_path> <out.json>
 """
+
 import asyncio
 import json
 import os
@@ -20,7 +21,7 @@ from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from scenarios import SCENARIOS, WARMUP_ITERATIONS, MEASURED_ITERATIONS  # noqa: E402
+from scenarios import MEASURED_ITERATIONS, SCENARIOS, WARMUP_ITERATIONS  # noqa: E402
 
 
 async def time_scenario(session, tool_name, kwargs, iterations):
@@ -65,11 +66,15 @@ async def main(server_py: str, testbed_path: str, out_path: str):
                 results[name] = {"status": "measured", "tool": tool_name, "samples": samples}
 
     with open(out_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "connect_elapsed_s": connect_elapsed,
-            "transport": "stdio",
-            "results": results,
-        }, f, indent=2)
+        json.dump(
+            {
+                "connect_elapsed_s": connect_elapsed,
+                "transport": "stdio",
+                "results": results,
+            },
+            f,
+            indent=2,
+        )
 
 
 if __name__ == "__main__":

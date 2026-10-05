@@ -54,7 +54,7 @@ RUN echo "==> Pinning setuptools<81 (last release shipping pkg_resources)..." \
     && pip install --no-cache-dir --force-reinstall "setuptools<81"
 
 # Copy your application code into the container's working directory
-COPY pyats_mcp_server.py .
+COPY pyats_mcp_server.py pyats_tasks.py .
 
 # Optional: If you have other files needed by the script (e.g., commands.json), copy them too
 # COPY commands.json .

@@ -13,6 +13,7 @@ Usage:
     server, to isolate the protocol-version effect from the
     stateless_http transport flag).
 """
+
 import asyncio
 import json
 import sys
@@ -21,7 +22,7 @@ import time
 from mcp.client.client import Client
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from scenarios import SCENARIOS, WARMUP_ITERATIONS, MEASURED_ITERATIONS  # noqa: E402
+from scenarios import MEASURED_ITERATIONS, SCENARIOS, WARMUP_ITERATIONS  # noqa: E402
 
 
 async def time_scenario(client, tool_name, kwargs, iterations):
@@ -59,12 +60,16 @@ async def main(url: str, mode: str, out_path: str):
             results[name] = {"status": "measured", "tool": tool_name, "samples": samples}
 
     with open(out_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "connect_elapsed_s": connect_elapsed,
-            "url": url,
-            "client_mode": mode,
-            "results": results,
-        }, f, indent=2)
+        json.dump(
+            {
+                "connect_elapsed_s": connect_elapsed,
+                "url": url,
+                "client_mode": mode,
+                "results": results,
+            },
+            f,
+            indent=2,
+        )
 
 
 if __name__ == "__main__":
