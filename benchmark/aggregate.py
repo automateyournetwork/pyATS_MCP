@@ -7,6 +7,7 @@ _run_http_post.py and render a Markdown comparison table.
 Usage:
     python3 benchmark/aggregate.py <label1>=<file1.json> <label2>=<file2.json> ...
 """
+
 import json
 import statistics
 import sys

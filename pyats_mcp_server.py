@@ -50,6 +50,8 @@ from mcp.server.mcpserver import MCPServer
 from pyats.async_ import pcall
 from pyats.topology import loader
 
+from pyats_tasks import PyatsTasks
+
 # ---------------------------------------------------------------------------
 # Logging — written to stderr so STDIO transport is not polluted
 # ---------------------------------------------------------------------------
@@ -85,6 +87,7 @@ XPRESSO_URL: str = os.getenv("XPRESSO_URL", "").rstrip("/")
 XPRESSO_API_TOKEN: str = os.getenv("XPRESSO_API_TOKEN", "")
 XPRESSO_GROUP: str = os.getenv("XPRESSO_GROUP", "")
 
+
 # Testbed re-load interval (seconds); avoids hammering disk on every call
 def _parse_int_env(var: str, default: int) -> int:
     raw = os.getenv(var, str(default))
@@ -93,6 +96,7 @@ def _parse_int_env(var: str, default: int) -> int:
     except ValueError:
         logger.warning("Invalid value for %s=%r; using default %d", var, raw, default)
         return default
+
 
 _TESTBED_CACHE_TTL: int = _parse_int_env("PYATS_MCP_TESTBED_CACHE_TTL", 30)
 _testbed_cache: Dict[str, Any] = {"loaded_at": 0.0, "tb": None}
@@ -104,14 +108,14 @@ _conn_cache: Dict[str, Dict[str, Any]] = {}
 # Connection defaults — these are used only when the testbed does NOT define a value
 # Set to empty string to disable the MCP default and use only testbed-defined values
 _DEFAULT_CONNECTION_TIMEOUT: Optional[int] = (
-    None if os.getenv("PYATS_MCP_CONNECTION_TIMEOUT", "") == ""
+    None
+    if os.getenv("PYATS_MCP_CONNECTION_TIMEOUT", "") == ""
     else _parse_int_env("PYATS_MCP_CONNECTION_TIMEOUT", 120)
 )
 _DEFAULT_LEARN_HOSTNAME: bool = os.getenv("PYATS_MCP_LEARN_HOSTNAME", "1") == "1"
 _DEFAULT_LOG_STDOUT: bool = os.getenv("PYATS_MCP_LOG_STDOUT", "0") == "1"
 _DEFAULT_MIT: Optional[bool] = (
-    None if os.getenv("PYATS_MCP_MIT", "") == ""
-    else os.getenv("PYATS_MCP_MIT", "1") == "1"
+    None if os.getenv("PYATS_MCP_MIT", "") == "" else os.getenv("PYATS_MCP_MIT", "1") == "1"
 )
 
 # In-memory operation log — survives for the lifetime of the server process
@@ -154,6 +158,7 @@ def clean_output(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Operation log
 # ---------------------------------------------------------------------------
+
 
 def _log_op(
     tool: str,
@@ -207,6 +212,7 @@ def _err(
 # ---------------------------------------------------------------------------
 # Testbed helpers
 # ---------------------------------------------------------------------------
+
 
 def _load_testbed():
     """Return the cached testbed, reloading from disk when the TTL has expired."""
@@ -263,7 +269,7 @@ def _get_testbed_connection_args(device) -> Dict[str, Any]:
     return args
 
 
-def _evict_expired_connections() -> None:
+def _evict_expired_connections(device_name: Optional[str] = None) -> None:
     """Disconnect and evict cache entries whose TTL has elapsed."""
     if _CONN_CACHE_TTL <= 0:
         return
@@ -273,8 +279,10 @@ def _evict_expired_connections() -> None:
     # dev.disconnect() I/O then happens outside the lock.
     with _STATE_LOCK:
         expired = [
-            k for k, v in _conn_cache.items()
-            if (now - float(v.get("last_used", 0))) > _CONN_CACHE_TTL
+            k
+            for k, v in _conn_cache.items()
+            if (device_name is None or k == device_name)
+            and (now - float(v.get("last_used", 0))) > _CONN_CACHE_TTL
         ]
         expired_entries = [(k, _conn_cache.pop(k, None)) for k in expired]
     for name, entry in expired_entries:
@@ -312,7 +320,7 @@ def _get_device(device_name: str):
         )
 
     if _CONN_CACHE_TTL > 0:
-        _evict_expired_connections()
+        _evict_expired_connections(device_name)
         with _STATE_LOCK:
             cached = _conn_cache.get(device_name, {}).get("device")
             if cached and getattr(cached, "is_connected", lambda: False)():
@@ -469,6 +477,7 @@ def _config_guardrails(config_lines: List[str]) -> Optional[str]:
 # Core blocking executors  (run in thread-pool via run_in_executor)
 # ---------------------------------------------------------------------------
 
+
 def _execute_show_command(device_name: str, command: str) -> Dict[str, Any]:
     """
     Execute *command* on *device_name*.
@@ -482,15 +491,23 @@ def _execute_show_command(device_name: str, command: str) -> Dict[str, Any]:
         try:
             logger.info("Parsing '%s' on %s", command, device_name)
             return {
-                "status": "completed", "device": device_name,
-                "command": command, "output": device.parse(command), "parsed": True,
+                "status": "completed",
+                "device": device_name,
+                "command": command,
+                "output": device.parse(command),
+                "parsed": True,
             }
         except Exception as exc:
-            logger.warning("Parse failed for '%s' on %s (%s) — using raw output", command, device_name, exc)
+            logger.warning(
+                "Parse failed for '%s' on %s (%s) — using raw output", command, device_name, exc
+            )
             raw = device.execute(command)
             return {
-                "status": "completed", "device": device_name, "command": command,
-                "output": clean_output(raw) if isinstance(raw, str) else raw, "parsed": False,
+                "status": "completed",
+                "device": device_name,
+                "command": command,
+                "output": clean_output(raw) if isinstance(raw, str) else raw,
+                "parsed": False,
             }
     except Exception as exc:
         logger.error("_execute_show_command failed: %s", exc, exc_info=True)
@@ -509,7 +526,9 @@ def _execute_show_raw(device_name: str, command: str) -> Dict[str, Any]:
     return _execute_show_command(device_name, command)
 
 
-def _execute_config(device_name: str, config_commands: Union[str, List[Any], None]) -> Dict[str, Any]:
+def _execute_config(
+    device_name: str, config_commands: Union[str, List[Any], None]
+) -> Dict[str, Any]:
     """
     Apply *config_commands* to *device_name* via device.configure().
 
@@ -521,8 +540,11 @@ def _execute_config(device_name: str, config_commands: Union[str, List[Any], Non
         device = _get_device(device_name)
         lines = _normalize_config_lines(config_commands)
         if not lines:
-            return {"status": "error", "device": device_name,
-                    "error": "No configuration lines after normalisation."}
+            return {
+                "status": "error",
+                "device": device_name,
+                "error": "No configuration lines after normalisation.",
+            }
         guard = _config_guardrails(lines)
         if guard:
             return {"status": "error", "device": device_name, "error": guard}
@@ -530,7 +552,8 @@ def _execute_config(device_name: str, config_commands: Union[str, List[Any], Non
         logger.info("Configuring %s: %s", device_name, lines)
         out = device.configure(lines)  # pass list — unicon handles submode correctly
         return {
-            "status": "success", "device": device_name,
+            "status": "success",
+            "device": device_name,
             "message": "Configuration applied successfully.",
             "commands_applied": lines,
             "output": clean_output(out) if isinstance(out, str) else out,
@@ -640,7 +663,9 @@ def _execute_learn_feature(device_name: str, feature: str) -> Dict[str, Any]:
             learned = {k: v for k, v in vars(ops).items() if not k.startswith("_")}
         learned = _to_jsonable(learned)
         return {
-            "status": "completed", "device": device_name, "feature": feature,
+            "status": "completed",
+            "device": device_name,
+            "feature": feature,
             "learned": learned,
         }
     except Exception as exc:
@@ -683,22 +708,32 @@ def _execute_get_neighbors(device_name: str) -> Dict[str, Any]:
                     for idx, e in parsed.get("index", {}).items()
                 ]
                 return {
-                    "status": "completed", "device": device_name,
-                    "protocol": proto, "neighbors": neighbors, "raw_parsed": parsed,
+                    "status": "completed",
+                    "device": device_name,
+                    "protocol": proto,
+                    "neighbors": neighbors,
+                    "raw_parsed": parsed,
                 }
             except Exception:
                 # Parser failed — try raw, return immediately with empty neighbors list
                 try:
                     raw = clean_output(device.execute(cmd))
                     return {
-                        "status": "completed", "device": device_name,
-                        "protocol": proto, "neighbors": [], "raw_output": raw, "parsed": False,
+                        "status": "completed",
+                        "device": device_name,
+                        "protocol": proto,
+                        "neighbors": [],
+                        "raw_output": raw,
+                        "parsed": False,
                     }
                 except Exception:
                     continue  # Try the next protocol
 
-        return {"status": "error", "device": device_name,
-                "error": "Neither CDP nor LLDP commands succeeded on this device."}
+        return {
+            "status": "error",
+            "device": device_name,
+            "error": "Neither CDP nor LLDP commands succeeded on this device.",
+        }
     except Exception as exc:
         return {"status": "error", "device": device_name, "error": str(exc)}
     finally:
@@ -725,7 +760,9 @@ def _execute_find_interface_by_ip(device_name: str, ip_address: str) -> Dict[str
                     if isinstance(addr, dict):
                         for a in addr:
                             if ip_address in a:
-                                matches.append({"device": device_name, "interface": intf, "address": a})
+                                matches.append(
+                                    {"device": device_name, "interface": intf, "address": a}
+                                )
                     elif isinstance(addr, str) and ip_address in addr:
                         matches.append({"device": device_name, "interface": intf, "address": addr})
                 if matches:
@@ -741,8 +778,12 @@ def _execute_find_interface_by_ip(device_name: str, ip_address: str) -> Dict[str
                 except Exception:
                     continue
 
-        return {"status": "completed", "device": device_name,
-                "ip_searched": ip_address, "matches": matches}
+        return {
+            "status": "completed",
+            "device": device_name,
+            "ip_searched": ip_address,
+            "matches": matches,
+        }
     except Exception as exc:
         return {"status": "error", "device": device_name, "error": str(exc)}
     finally:
@@ -752,6 +793,7 @@ def _execute_find_interface_by_ip(device_name: str, ip_address: str) -> Dict[str
 # ---------------------------------------------------------------------------
 # Async wrappers — offload blocking executors to the thread pool
 # ---------------------------------------------------------------------------
+
 
 async def _run_in_executor(fn, *args) -> Any:
     """Convenience wrapper: run *fn(*args)* in the default thread-pool executor."""
@@ -792,7 +834,9 @@ async def _apply_config_with_diff(
         before = await _run_in_executor(_execute_get_running_config_str, device_name)
     except Exception as exc:
         return _err(
-            "pyats_configure_with_diff", device_name, None,
+            "pyats_configure_with_diff",
+            device_name,
+            None,
             f"Failed to capture pre-config snapshot: {exc}",
             "Check connectivity with pyats_device_health first.",
         )
@@ -811,12 +855,14 @@ async def _apply_config_with_diff(
         result["diff_warning"] = f"Config applied but post-snapshot failed: {exc}"
         return result
 
-    diff_lines = list(difflib.unified_diff(
-        before.splitlines(keepends=True),
-        after.splitlines(keepends=True),
-        fromfile=f"{device_name}:before",
-        tofile=f"{device_name}:after",
-    ))
+    diff_lines = list(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile=f"{device_name}:before",
+            tofile=f"{device_name}:after",
+        )
+    )
     result["diff"] = (
         "".join(diff_lines) if diff_lines else "(no diff — lines may already be present)"
     )
@@ -827,13 +873,29 @@ async def _apply_config_with_diff(
 # ---------------------------------------------------------------------------
 # Dynamic test execution (pyATS AEtest)
 # ---------------------------------------------------------------------------
-_BANNED_IMPORTS: frozenset = frozenset({
-    "os", "sys", "subprocess", "shutil", "socket", "pathlib",
-    "pickle", "yaml", "requests", "urllib", "http", "ssl",
-})
+_BANNED_IMPORTS: frozenset = frozenset(
+    {
+        "os",
+        "sys",
+        "subprocess",
+        "shutil",
+        "socket",
+        "pathlib",
+        "pickle",
+        "yaml",
+        "requests",
+        "urllib",
+        "http",
+        "ssl",
+    }
+)
 _BANNED_PATTERNS: List[str] = [
-    r"\b__import__\b", r"\beval\s*\(", r"\bexec\s*\(",
-    r"\bcompile\s*\(", r"\bopen\s*\(", r"\bjson\.loads\s*\(",
+    r"\b__import__\b",
+    r"\beval\s*\(",
+    r"\bexec\s*\(",
+    r"\bcompile\s*\(",
+    r"\bopen\s*\(",
+    r"\bjson\.loads\s*\(",
 ]
 _IMPORT_RE = re.compile(r"^\s*(import|from)\s+([a-zA-Z0-9_.]+)", re.MULTILINE)
 
@@ -913,14 +975,18 @@ def _run_test_script(script_content: str, timeout_s: int = 300) -> Dict[str, Any
         cmd = [shutil.which("pyats") or "pyats", "run", "job", str(job_path)]
         try:
             proc = subprocess.run(
-                cmd, capture_output=True, text=True,
+                cmd,
+                capture_output=True,
+                text=True,
                 env={**os.environ, "PYATS_TESTBED_PATH": TESTBED_PATH},
                 timeout=timeout_s,
             )
         except subprocess.TimeoutExpired:
-            return {"status": "error",
-                    "error": f"pyATS job timed out after {timeout_s}s",
-                    "artifacts_dir": str(run_dir)}
+            return {
+                "status": "error",
+                "error": f"pyATS job timed out after {timeout_s}s",
+                "artifacts_dir": str(run_dir),
+            }
 
         report_info = _extract_job_report(proc.stdout)
 
@@ -933,7 +999,8 @@ def _run_test_script(script_content: str, timeout_s: int = 300) -> Dict[str, Any
             "report": report_info["report"],
             "artifacts_dir": str(run_dir),
             "paths": {
-                "script": str(script_path), "job": str(job_path),
+                "script": str(script_path),
+                "job": str(job_path),
                 "archive": report_info["archive_path"],
             },
         }
@@ -948,12 +1015,24 @@ def _run_test_script(script_content: str, timeout_s: int = 300) -> Dict[str, Any
 # ---------------------------------------------------------------------------
 # MCP server instance
 # ---------------------------------------------------------------------------
-mcp = MCPServer("pyATS Network Automation Server")
+task_runtime = PyatsTasks(
+    Path(os.getenv("PYATS_MCP_TASK_DB", str(ARTIFACTS_DIR / "tasks.sqlite3"))),
+    device_names=lambda: list(_load_testbed().devices),
+    workers=_parse_int_env("PYATS_MCP_TASK_WORKERS", 4),
+    max_tasks=_parse_int_env("PYATS_MCP_TASK_MAX", 1000),
+    retention=_parse_int_env("PYATS_MCP_TASK_RETENTION", 86400),
+)
+mcp = MCPServer(
+    "pyATS Network Automation Server",
+    extensions=[task_runtime],
+    lifespan=task_runtime.lifespan,
+)
 
 
 # ===========================================================================
 # DEVICE DISCOVERY TOOLS
 # ===========================================================================
+
 
 @mcp.tool()
 async def pyats_list_devices() -> str:
@@ -1019,8 +1098,9 @@ async def pyats_search_devices(query: str, min_score: float = 0.4) -> str:
         tb = _load_testbed()
         q = (query or "").strip().lower()
         if not q:
-            return json.dumps(_err("pyats_search_devices", None, None,
-                                   "query must not be empty."), indent=2)
+            return json.dumps(
+                _err("pyats_search_devices", None, None, "query must not be empty."), indent=2
+            )
 
         q_tokens = set(re.split(r"[\s\-_./]+", q))
         results = []
@@ -1036,13 +1116,16 @@ async def pyats_search_devices(query: str, min_score: float = 0.4) -> str:
                 score = max(token_score, fuzzy_score)
 
             if score >= min_score:
-                results.append({
-                    "name": name, "score": round(score, 3),
-                    "os": getattr(dev, "os", None),
-                    "type": getattr(dev, "type", None),
-                    "platform": getattr(dev, "platform", None),
-                    "connections": list(getattr(dev, "connections", {}).keys()),
-                })
+                results.append(
+                    {
+                        "name": name,
+                        "score": round(score, 3),
+                        "os": getattr(dev, "os", None),
+                        "type": getattr(dev, "type", None),
+                        "platform": getattr(dev, "platform", None),
+                        "connections": list(getattr(dev, "connections", {}).keys()),
+                    }
+                )
 
         results.sort(key=lambda x: x["score"], reverse=True)
         _log_op("pyats_search_devices", None, query, "completed")
@@ -1055,6 +1138,7 @@ async def pyats_search_devices(query: str, min_score: float = 0.4) -> str:
 # ===========================================================================
 # SHOW / READ TOOLS
 # ===========================================================================
+
 
 @mcp.tool()
 async def pyats_run_show_command(
@@ -1101,11 +1185,23 @@ async def pyats_run_show_command(
                     last["attempt"] = attempt
                 _log_op("pyats_run_show_command", device_name, command, "completed")
                 return json.dumps(last, indent=2)
-            logger.warning("Attempt %d/%d failed for '%s' on %s: %s",
-                           attempt, retries, command, device_name, last.get("error"))
+            logger.warning(
+                "Attempt %d/%d failed for '%s' on %s: %s",
+                attempt,
+                retries,
+                command,
+                device_name,
+                last.get("error"),
+            )
         except asyncio.TimeoutError:
-            logger.warning("Attempt %d/%d timed out (%ds) for '%s' on %s",
-                           attempt, retries, timeout, command, device_name)
+            logger.warning(
+                "Attempt %d/%d timed out (%ds) for '%s' on %s",
+                attempt,
+                retries,
+                timeout,
+                command,
+                device_name,
+            )
             last = {"status": "error", "error": f"Timed out after {timeout}s."}
         except Exception as exc:
             logger.error("Attempt %d/%d error: %s", attempt, retries, exc, exc_info=True)
@@ -1148,27 +1244,49 @@ async def pyats_run_show_command_multi(device_names: List[str], command: str) ->
         }
     """
     if not device_names:
-        return json.dumps(_err("pyats_run_show_command_multi", None, command,
-                               "device_names is empty.",
-                               "Call pyats_list_devices to get valid names."), indent=2)
+        return json.dumps(
+            _err(
+                "pyats_run_show_command_multi",
+                None,
+                command,
+                "device_names is empty.",
+                "Call pyats_list_devices to get valid names.",
+            ),
+            indent=2,
+        )
     err = validate_show_command(command)
     if err:
         return json.dumps(_err("pyats_run_show_command_multi", None, command, err), indent=2)
 
     try:
         loop = asyncio.get_running_loop()
-        tasks = [loop.run_in_executor(None, partial(_execute_show_raw, name, command))
-                 for name in device_names]
+        tasks = [
+            loop.run_in_executor(None, partial(_execute_show_raw, name, command))
+            for name in device_names
+        ]
         results: List[Dict[str, Any]] = list(await asyncio.gather(*tasks))
         success = sum(1 for r in results if r.get("status") == "completed")
         for r in results:
-            _log_op("pyats_run_show_command_multi", r.get("device"), command,
-                    r.get("status", "error"), r.get("error"))
-        return json.dumps({
-            "status": "completed", "command": command,
-            "summary": {"total": len(results), "success": success, "failed": len(results) - success},
-            "results": results,
-        }, indent=2)
+            _log_op(
+                "pyats_run_show_command_multi",
+                r.get("device"),
+                command,
+                r.get("status", "error"),
+                r.get("error"),
+            )
+        return json.dumps(
+            {
+                "status": "completed",
+                "command": command,
+                "summary": {
+                    "total": len(results),
+                    "success": success,
+                    "failed": len(results) - success,
+                },
+                "results": results,
+            },
+            indent=2,
+        )
     except Exception as exc:
         logger.error("pyats_run_show_command_multi failed: %s", exc, exc_info=True)
         return json.dumps(_err("pyats_run_show_command_multi", None, command, str(exc)), indent=2)
@@ -1222,25 +1340,47 @@ async def pyats_pcall_show_command(device_names: List[str], command: str) -> str
         }
     """
     if not device_names:
-        return json.dumps(_err("pyats_pcall_show_command", None, command,
-                               "device_names is empty.",
-                               "Call pyats_list_devices to get valid names."), indent=2)
+        return json.dumps(
+            _err(
+                "pyats_pcall_show_command",
+                None,
+                command,
+                "device_names is empty.",
+                "Call pyats_list_devices to get valid names.",
+            ),
+            indent=2,
+        )
     err = validate_show_command(command)
     if err:
         return json.dumps(_err("pyats_pcall_show_command", None, command, err), indent=2)
 
     try:
-        results: List[Dict[str, Any]] = await _run_in_executor(_pcall_show_command, device_names, command)
+        results: List[Dict[str, Any]] = await _run_in_executor(
+            _pcall_show_command, device_names, command
+        )
         success = sum(1 for r in results if r.get("status") == "completed")
         for r in results:
-            _log_op("pyats_pcall_show_command", r.get("device"), command,
-                    r.get("status", "error"), r.get("error"))
-        return json.dumps({
-            "status": "completed", "command": command,
-            "concurrency": "pcall (process per device)",
-            "summary": {"total": len(results), "success": success, "failed": len(results) - success},
-            "results": results,
-        }, indent=2)
+            _log_op(
+                "pyats_pcall_show_command",
+                r.get("device"),
+                command,
+                r.get("status", "error"),
+                r.get("error"),
+            )
+        return json.dumps(
+            {
+                "status": "completed",
+                "command": command,
+                "concurrency": "pcall (process per device)",
+                "summary": {
+                    "total": len(results),
+                    "success": success,
+                    "failed": len(results) - success,
+                },
+                "results": results,
+            },
+            indent=2,
+        )
     except Exception as exc:
         logger.error("pyats_pcall_show_command failed: %s", exc, exc_info=True)
         return json.dumps(_err("pyats_pcall_show_command", None, command, str(exc)), indent=2)
@@ -1264,7 +1404,8 @@ async def pyats_show_running_config(device_name: str) -> str:
     try:
         result = await _run_in_executor(
             lambda n: {
-                "status": "completed", "device": n,
+                "status": "completed",
+                "device": n,
                 "output": _execute_get_running_config_str(n),
             },
             device_name,
@@ -1273,8 +1414,10 @@ async def pyats_show_running_config(device_name: str) -> str:
         return json.dumps(result, indent=2)
     except Exception as exc:
         logger.error("pyats_show_running_config failed: %s", exc, exc_info=True)
-        return json.dumps(_err("pyats_show_running_config", device_name,
-                               "show running-config", str(exc)), indent=2)
+        return json.dumps(
+            _err("pyats_show_running_config", device_name, "show running-config", str(exc)),
+            indent=2,
+        )
 
 
 @mcp.tool()
@@ -1292,13 +1435,17 @@ async def pyats_show_logging(device_name: str) -> str:
     Returns:
         { "status": "completed", "device": "...", "output": "<log text>" }
     """
+
     def _get_logs(name: str) -> Dict[str, Any]:
         device = None
         try:
             device = _get_device(name)
             device.enable()
-            return {"status": "completed", "device": name,
-                    "output": clean_output(device.execute("show logging"))}
+            return {
+                "status": "completed",
+                "device": name,
+                "output": clean_output(device.execute("show logging")),
+            }
         except Exception as exc:
             return {"status": "error", "device": name, "error": str(exc)}
         finally:
@@ -1310,7 +1457,9 @@ async def pyats_show_logging(device_name: str) -> str:
         return json.dumps(result, indent=2)
     except Exception as exc:
         logger.error("pyats_show_logging failed: %s", exc, exc_info=True)
-        return json.dumps(_err("pyats_show_logging", device_name, "show logging", str(exc)), indent=2)
+        return json.dumps(
+            _err("pyats_show_logging", device_name, "show logging", str(exc)), indent=2
+        )
 
 
 @mcp.tool()
@@ -1347,8 +1496,13 @@ async def pyats_device_health(device_name: str) -> str:
     """
     try:
         result = await _run_in_executor(_execute_health, device_name)
-        _log_op("pyats_device_health", device_name, "health_snapshot",
-                result.get("status", "error"), result.get("error"))
+        _log_op(
+            "pyats_device_health",
+            device_name,
+            "health_snapshot",
+            result.get("status", "error"),
+            result.get("error"),
+        )
         return json.dumps(result, indent=2)
     except Exception as exc:
         logger.error("pyats_device_health failed: %s", exc, exc_info=True)
@@ -1391,8 +1545,13 @@ async def pyats_learn_feature(
             with _STATE_LOCK:
                 _learn_snapshots[f"{device_name}:{feature}:{snapshot_label}"] = result["learned"]
             result["snapshot_saved"] = snapshot_label
-        _log_op("pyats_learn_feature", device_name, feature,
-                result.get("status", "error"), result.get("error"))
+        _log_op(
+            "pyats_learn_feature",
+            device_name,
+            feature,
+            result.get("status", "error"),
+            result.get("error"),
+        )
         return json.dumps(result, indent=2)
     except Exception as exc:
         logger.error("pyats_learn_feature failed: %s", exc, exc_info=True)
@@ -1433,24 +1592,43 @@ async def pyats_diff_learned_snapshots(
 
     missing = [lbl for lbl, snap in ((label_a, snap_a), (label_b, snap_b)) if snap is None]
     if missing:
-        return json.dumps(_err(
-            "pyats_diff_learned_snapshots", device_name, feature,
-            f"No snapshot found for label(s): {', '.join(missing)}.",
-            "Call pyats_learn_feature with snapshot_label set for each label first.",
-        ), indent=2)
+        return json.dumps(
+            _err(
+                "pyats_diff_learned_snapshots",
+                device_name,
+                feature,
+                f"No snapshot found for label(s): {', '.join(missing)}.",
+                "Call pyats_learn_feature with snapshot_label set for each label first.",
+            ),
+            indent=2,
+        )
 
     try:
         diff = Diff(snap_a, snap_b)
         diff.findDiff()
         diff_text = str(diff)
-        _log_op("pyats_diff_learned_snapshots", device_name, f"{feature}:{label_a}->{label_b}", "completed")
-        return json.dumps({
-            "status": "completed", "device": device_name, "feature": feature,
-            "label_a": label_a, "label_b": label_b, "diff": diff_text,
-        }, indent=2)
+        _log_op(
+            "pyats_diff_learned_snapshots",
+            device_name,
+            f"{feature}:{label_a}->{label_b}",
+            "completed",
+        )
+        return json.dumps(
+            {
+                "status": "completed",
+                "device": device_name,
+                "feature": feature,
+                "label_a": label_a,
+                "label_b": label_b,
+                "diff": diff_text,
+            },
+            indent=2,
+        )
     except Exception as exc:
         logger.error("pyats_diff_learned_snapshots failed: %s", exc, exc_info=True)
-        return json.dumps(_err("pyats_diff_learned_snapshots", device_name, feature, str(exc)), indent=2)
+        return json.dumps(
+            _err("pyats_diff_learned_snapshots", device_name, feature, str(exc)), indent=2
+        )
 
 
 @mcp.tool()
@@ -1476,8 +1654,15 @@ async def pyats_ping_from_network_device(device_name: str, command: str) -> str:
     """
     cmd = (command or "").strip()
     if not cmd.lower().startswith("ping"):
-        return json.dumps(_err("pyats_ping_from_network_device", device_name, command,
-                               f"'{command}' is not a ping command."), indent=2)
+        return json.dumps(
+            _err(
+                "pyats_ping_from_network_device",
+                device_name,
+                command,
+                f"'{command}' is not a ping command.",
+            ),
+            indent=2,
+        )
 
     def _ping(name: str, c: str) -> Dict[str, Any]:
         device = None
@@ -1488,11 +1673,21 @@ async def pyats_ping_from_network_device(device_name: str, command: str) -> str:
             except Exception as exc:
                 logger.warning("Could not enable %s: %s", name, exc)
             try:
-                return {"status": "completed", "device": name, "command": c,
-                        "output": device.parse(c), "parsed": True}
+                return {
+                    "status": "completed",
+                    "device": name,
+                    "command": c,
+                    "output": device.parse(c),
+                    "parsed": True,
+                }
             except Exception:
-                return {"status": "completed", "device": name, "command": c,
-                        "output": clean_output(device.execute(c)), "parsed": False}
+                return {
+                    "status": "completed",
+                    "device": name,
+                    "command": c,
+                    "output": clean_output(device.execute(c)),
+                    "parsed": False,
+                }
         except Exception as exc:
             return {"status": "error", "device": name, "command": c, "error": str(exc)}
         finally:
@@ -1500,12 +1695,19 @@ async def pyats_ping_from_network_device(device_name: str, command: str) -> str:
 
     try:
         result = await _run_in_executor(_ping, device_name, cmd)
-        _log_op("pyats_ping_from_network_device", device_name, cmd,
-                result.get("status", "error"), result.get("error"))
+        _log_op(
+            "pyats_ping_from_network_device",
+            device_name,
+            cmd,
+            result.get("status", "error"),
+            result.get("error"),
+        )
         return json.dumps(result, indent=2)
     except Exception as exc:
         logger.error("pyats_ping_from_network_device failed: %s", exc, exc_info=True)
-        return json.dumps(_err("pyats_ping_from_network_device", device_name, cmd, str(exc)), indent=2)
+        return json.dumps(
+            _err("pyats_ping_from_network_device", device_name, cmd, str(exc)), indent=2
+        )
 
 
 @mcp.tool()
@@ -1542,8 +1744,13 @@ async def pyats_get_neighbors(device_name: str) -> str:
     """
     try:
         result = await _run_in_executor(_execute_get_neighbors, device_name)
-        _log_op("pyats_get_neighbors", device_name, "get_neighbors",
-                result.get("status", "error"), result.get("error"))
+        _log_op(
+            "pyats_get_neighbors",
+            device_name,
+            "get_neighbors",
+            result.get("status", "error"),
+            result.get("error"),
+        )
         return json.dumps(result, indent=2)
     except Exception as exc:
         logger.error("pyats_get_neighbors failed: %s", exc, exc_info=True)
@@ -1593,16 +1800,23 @@ async def pyats_find_interface_by_ip(
         tb = _load_testbed()
         names = device_names if device_names else list(tb.devices.keys())
         loop = asyncio.get_running_loop()
-        tasks = [loop.run_in_executor(None, partial(_execute_find_interface_by_ip, n, ip_address))
-                 for n in names]
+        tasks = [
+            loop.run_in_executor(None, partial(_execute_find_interface_by_ip, n, ip_address))
+            for n in names
+        ]
         device_results: List[Dict[str, Any]] = list(await asyncio.gather(*tasks))
         all_matches = [m for dr in device_results for m in dr.get("matches", [])]
         _log_op("pyats_find_interface_by_ip", None, ip_address, "completed")
-        return json.dumps({
-            "status": "completed", "ip_searched": ip_address,
-            "total_devices_searched": len(names),
-            "matches": all_matches, "device_results": device_results,
-        }, indent=2)
+        return json.dumps(
+            {
+                "status": "completed",
+                "ip_searched": ip_address,
+                "total_devices_searched": len(names),
+                "matches": all_matches,
+                "device_results": device_results,
+            },
+            indent=2,
+        )
     except Exception as exc:
         logger.error("pyats_find_interface_by_ip failed: %s", exc, exc_info=True)
         return json.dumps(_err("pyats_find_interface_by_ip", None, ip_address, str(exc)), indent=2)
@@ -1625,24 +1839,36 @@ async def pyats_run_linux_command(device_name: str, command: str) -> str:
     Returns:
         { "status": "completed", "device": "...", "command": "...", "output": "..." }
     """
+
     def _linux(name: str, cmd: str) -> Dict[str, Any]:
         device = None
         try:
             tb = _load_testbed()
             if name not in tb.devices:
-                return {"status": "error", "device": name,
-                        "error": f"Device '{name}' not found in testbed."}
+                return {
+                    "status": "error",
+                    "device": name,
+                    "error": f"Device '{name}' not found in testbed.",
+                }
             device = tb.devices[name]
             if not device.is_connected():
                 device.connect()
             # Wrap piped/redirected commands for shell execution
             exec_cmd = f'sh -c "{cmd}"' if (">" in cmd or "|" in cmd) else cmd
             try:
-                output = device.parse(exec_cmd) if get_parser(exec_cmd, device) else device.execute(exec_cmd)
+                output = (
+                    device.parse(exec_cmd)
+                    if get_parser(exec_cmd, device)
+                    else device.execute(exec_cmd)
+                )
             except Exception:
                 output = device.execute(exec_cmd)
-            return {"status": "completed", "device": name, "command": cmd,
-                    "output": clean_output(output) if isinstance(output, str) else output}
+            return {
+                "status": "completed",
+                "device": name,
+                "command": cmd,
+                "output": clean_output(output) if isinstance(output, str) else output,
+            }
         except Exception as exc:
             return {"status": "error", "device": name, "error": str(exc)}
         finally:
@@ -1650,8 +1876,13 @@ async def pyats_run_linux_command(device_name: str, command: str) -> str:
 
     try:
         result = await _run_in_executor(_linux, device_name, command)
-        _log_op("pyats_run_linux_command", device_name, command,
-                result.get("status", "error"), result.get("error"))
+        _log_op(
+            "pyats_run_linux_command",
+            device_name,
+            command,
+            result.get("status", "error"),
+            result.get("error"),
+        )
         return json.dumps(result, indent=2)
     except Exception as exc:
         logger.error("pyats_run_linux_command failed: %s", exc, exc_info=True)
@@ -1661,6 +1892,7 @@ async def pyats_run_linux_command(device_name: str, command: str) -> str:
 # ===========================================================================
 # CONFIGURATION TOOLS
 # ===========================================================================
+
 
 @mcp.tool()
 async def pyats_configure_device(device_name: str, config_commands: Any) -> str:
@@ -1688,8 +1920,13 @@ async def pyats_configure_device(device_name: str, config_commands: Any) -> str:
     """
     try:
         result = await apply_device_configuration_async(device_name, config_commands)
-        _log_op("pyats_configure_device", device_name, str(config_commands)[:120],
-                result.get("status", "error"), result.get("error"))
+        _log_op(
+            "pyats_configure_device",
+            device_name,
+            str(config_commands)[:120],
+            result.get("status", "error"),
+            result.get("error"),
+        )
         return json.dumps(result, indent=2)
     except Exception as exc:
         logger.error("pyats_configure_device failed: %s", exc, exc_info=True)
@@ -1732,8 +1969,13 @@ async def pyats_configure_with_diff(
     """
     try:
         result = await _apply_config_with_diff(device_name, config_commands, save_rollback_snapshot)
-        _log_op("pyats_configure_with_diff", device_name, str(config_commands)[:120],
-                result.get("status", "error"), result.get("error"))
+        _log_op(
+            "pyats_configure_with_diff",
+            device_name,
+            str(config_commands)[:120],
+            result.get("status", "error"),
+            result.get("error"),
+        )
         return json.dumps(result, indent=2)
     except Exception as exc:
         logger.error("pyats_configure_with_diff failed: %s", exc, exc_info=True)
@@ -1768,21 +2010,33 @@ async def pyats_rollback_config(device_name: str) -> str:
         snapshot = _config_snapshots.get(device_name)
 
     if snapshot is None:
-        return json.dumps(_err(
-            "pyats_rollback_config", device_name, None,
-            f"No rollback snapshot found for '{device_name}'.",
-            "Snapshots are saved automatically by pyats_configure_with_diff. "
-            "If you used pyats_configure_device no snapshot was created.",
-        ), indent=2)
+        return json.dumps(
+            _err(
+                "pyats_rollback_config",
+                device_name,
+                None,
+                f"No rollback snapshot found for '{device_name}'.",
+                "Snapshots are saved automatically by pyats_configure_with_diff. "
+                "If you used pyats_configure_device no snapshot was created.",
+            ),
+            indent=2,
+        )
     # Strip comment lines before re-applying
-    lines = [l for l in snapshot.splitlines() if l.strip() and not l.strip().startswith("!")]
+    lines = [
+        line for line in snapshot.splitlines() if line.strip() and not line.strip().startswith("!")
+    ]
 
     try:
         result = await apply_device_configuration_async(device_name, lines)
         result["message"] = "Rollback applied successfully."
         result["snapshot_lines"] = len(lines)
-        _log_op("pyats_rollback_config", device_name, "rollback",
-                result.get("status", "error"), result.get("error"))
+        _log_op(
+            "pyats_rollback_config",
+            device_name,
+            "rollback",
+            result.get("status", "error"),
+            result.get("error"),
+        )
         return json.dumps(result, indent=2)
     except Exception as exc:
         logger.error("pyats_rollback_config failed: %s", exc, exc_info=True)
@@ -1825,23 +2079,44 @@ async def pyats_configure_devices_multi(
         }
     """
     if not device_names:
-        return json.dumps(_err("pyats_configure_devices_multi", None, None,
-                               "device_names is empty.",
-                               "Call pyats_list_devices to get valid names."), indent=2)
+        return json.dumps(
+            _err(
+                "pyats_configure_devices_multi",
+                None,
+                None,
+                "device_names is empty.",
+                "Call pyats_list_devices to get valid names.",
+            ),
+            indent=2,
+        )
     try:
         loop = asyncio.get_running_loop()
-        tasks = [loop.run_in_executor(None, partial(_execute_config, n, config_commands))
-                 for n in device_names]
+        tasks = [
+            loop.run_in_executor(None, partial(_execute_config, n, config_commands))
+            for n in device_names
+        ]
         results: List[Dict[str, Any]] = list(await asyncio.gather(*tasks))
         success = sum(1 for r in results if r.get("status") == "success")
         for r in results:
-            _log_op("pyats_configure_devices_multi", r.get("device"),
-                    str(config_commands)[:80], r.get("status", "error"), r.get("error"))
-        return json.dumps({
-            "status": "completed",
-            "summary": {"total": len(results), "success": success, "failed": len(results) - success},
-            "results": results,
-        }, indent=2)
+            _log_op(
+                "pyats_configure_devices_multi",
+                r.get("device"),
+                str(config_commands)[:80],
+                r.get("status", "error"),
+                r.get("error"),
+            )
+        return json.dumps(
+            {
+                "status": "completed",
+                "summary": {
+                    "total": len(results),
+                    "success": success,
+                    "failed": len(results) - success,
+                },
+                "results": results,
+            },
+            indent=2,
+        )
     except Exception as exc:
         logger.error("pyats_configure_devices_multi failed: %s", exc, exc_info=True)
         return json.dumps(_err("pyats_configure_devices_multi", None, None, str(exc)), indent=2)
@@ -1883,23 +2158,42 @@ async def pyats_pcall_configure_devices(
         }
     """
     if not device_names:
-        return json.dumps(_err("pyats_pcall_configure_devices", None, None,
-                               "device_names is empty.",
-                               "Call pyats_list_devices to get valid names."), indent=2)
+        return json.dumps(
+            _err(
+                "pyats_pcall_configure_devices",
+                None,
+                None,
+                "device_names is empty.",
+                "Call pyats_list_devices to get valid names.",
+            ),
+            indent=2,
+        )
     try:
         results: List[Dict[str, Any]] = await _run_in_executor(
             _pcall_configure_devices, device_names, config_commands
         )
         success = sum(1 for r in results if r.get("status") == "success")
         for r in results:
-            _log_op("pyats_pcall_configure_devices", r.get("device"),
-                    str(config_commands)[:80], r.get("status", "error"), r.get("error"))
-        return json.dumps({
-            "status": "completed",
-            "concurrency": "pcall (process per device)",
-            "summary": {"total": len(results), "success": success, "failed": len(results) - success},
-            "results": results,
-        }, indent=2)
+            _log_op(
+                "pyats_pcall_configure_devices",
+                r.get("device"),
+                str(config_commands)[:80],
+                r.get("status", "error"),
+                r.get("error"),
+            )
+        return json.dumps(
+            {
+                "status": "completed",
+                "concurrency": "pcall (process per device)",
+                "summary": {
+                    "total": len(results),
+                    "success": success,
+                    "failed": len(results) - success,
+                },
+                "results": results,
+            },
+            indent=2,
+        )
     except Exception as exc:
         logger.error("pyats_pcall_configure_devices failed: %s", exc, exc_info=True)
         return json.dumps(_err("pyats_pcall_configure_devices", None, None, str(exc)), indent=2)
@@ -1952,8 +2246,13 @@ def _execute_rest_request(
 ) -> Dict[str, Any]:
     method_u = (method or "").upper()
     if method_u not in _REST_METHODS:
-        return {"status": "error", "device": device_name, "method": method, "api_url": api_url,
-                "error": f"Unsupported method '{method}'. Use one of {sorted(_REST_METHODS)}."}
+        return {
+            "status": "error",
+            "device": device_name,
+            "method": method,
+            "api_url": api_url,
+            "error": f"Unsupported method '{method}'. Use one of {sorted(_REST_METHODS)}.",
+        }
     try:
         rest = _get_rest_device(device_name)
         kwargs: Dict[str, Any] = {"timeout": timeout}
@@ -1977,12 +2276,21 @@ def _execute_rest_request(
             body = body_text
 
         return {
-            "status": "completed", "device": device_name, "method": method_u, "api_url": api_url,
-            "status_code": resp.status_code, "body": body,
+            "status": "completed",
+            "device": device_name,
+            "method": method_u,
+            "api_url": api_url,
+            "status_code": resp.status_code,
+            "body": body,
         }
     except Exception as exc:
-        return {"status": "error", "device": device_name, "method": method_u, "api_url": api_url,
-                "error": str(exc)}
+        return {
+            "status": "error",
+            "device": device_name,
+            "method": method_u,
+            "api_url": api_url,
+            "error": str(exc),
+        }
 
 
 @mcp.tool()
@@ -2030,15 +2338,31 @@ async def pyats_rest_request(
           "api_url": "...", "status_code": 200, "body": {...} }
     """
     if not (device_name or "").strip():
-        return json.dumps(_err("pyats_rest_request", device_name, api_url, "device_name is empty."), indent=2)
+        return json.dumps(
+            _err("pyats_rest_request", device_name, api_url, "device_name is empty."), indent=2
+        )
     if not (api_url or "").strip():
-        return json.dumps(_err("pyats_rest_request", device_name, api_url, "api_url is empty."), indent=2)
+        return json.dumps(
+            _err("pyats_rest_request", device_name, api_url, "api_url is empty."), indent=2
+        )
     try:
         result = await _run_in_executor(
-            _execute_rest_request, device_name, method, api_url, payload, content_type, headers, timeout
+            _execute_rest_request,
+            device_name,
+            method,
+            api_url,
+            payload,
+            content_type,
+            headers,
+            timeout,
         )
-        _log_op("pyats_rest_request", device_name, f"{method} {api_url}",
-                result.get("status", "error"), result.get("error"))
+        _log_op(
+            "pyats_rest_request",
+            device_name,
+            f"{method} {api_url}",
+            result.get("status", "error"),
+            result.get("error"),
+        )
         return json.dumps(result, indent=2)
     except Exception as exc:
         logger.error("pyats_rest_request failed: %s", exc, exc_info=True)
@@ -2103,18 +2427,26 @@ def _execute_clean_device(
         clean_path.write_text(clean_yaml, encoding="utf-8")
 
         cmd = [
-            shutil.which("pyats") or "pyats", "clean",
-            "--testbed-file", TESTBED_PATH,
-            "--clean-file", str(clean_path),
-            "--clean-devices", device_name,
+            shutil.which("pyats") or "pyats",
+            "clean",
+            "--testbed-file",
+            TESTBED_PATH,
+            "--clean-file",
+            str(clean_path),
+            "--clean-devices",
+            device_name,
             "--no-mail",
         ]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
         except subprocess.TimeoutExpired:
-            return {"status": "error", "device": device_name,
-                    "error": f"pyats clean timed out after {timeout_s}s",
-                    "clean_yaml": clean_yaml, "artifacts_dir": str(run_dir)}
+            return {
+                "status": "error",
+                "device": device_name,
+                "error": f"pyats clean timed out after {timeout_s}s",
+                "clean_yaml": clean_yaml,
+                "artifacts_dir": str(run_dir),
+            }
 
         payload = {
             "status": "completed" if proc.returncode == 0 else "error",
@@ -2132,7 +2464,12 @@ def _execute_clean_device(
         return payload
     except Exception as exc:
         logger.error("_execute_clean_device failed: %s", exc, exc_info=True)
-        return {"status": "error", "device": device_name, "error": str(exc), "artifacts_dir": str(run_dir)}
+        return {
+            "status": "error",
+            "device": device_name,
+            "error": str(exc),
+            "artifacts_dir": str(run_dir),
+        }
 
 
 @mcp.tool()
@@ -2179,8 +2516,9 @@ async def pyats_clean_device(
           "stdout": "...", "clean_yaml": "...", "artifacts_dir": "..." }
     """
     if not commands:
-        return json.dumps(_err("pyats_clean_device", device_name, None,
-                               "commands is empty."), indent=2)
+        return json.dumps(
+            _err("pyats_clean_device", device_name, None, "commands is empty."), indent=2
+        )
     guard = _config_guardrails(commands)
     if guard:
         return json.dumps(_err("pyats_clean_device", device_name, None, guard), indent=2)
@@ -2188,23 +2526,38 @@ async def pyats_clean_device(
     if dry_run:
         clean_yaml = _build_clean_yaml(device_name, commands)
         _log_op("pyats_clean_device", device_name, "dry_run", "completed")
-        return json.dumps({
-            "status": "completed", "device": device_name, "dry_run": True,
-            "clean_yaml": clean_yaml,
-            "message": "Dry run only — no subprocess spawned, device not contacted.",
-        }, indent=2)
+        return json.dumps(
+            {
+                "status": "completed",
+                "device": device_name,
+                "dry_run": True,
+                "clean_yaml": clean_yaml,
+                "message": "Dry run only — no subprocess spawned, device not contacted.",
+            },
+            indent=2,
+        )
 
     if confirm != _CLEAN_CONFIRM_PHRASE:
-        return json.dumps(_err(
-            "pyats_clean_device", device_name, None,
-            "confirm did not match the required phrase.",
-            f"Pass confirm=\"{_CLEAN_CONFIRM_PHRASE}\" to run for real, or leave dry_run=True.",
-        ), indent=2)
+        return json.dumps(
+            _err(
+                "pyats_clean_device",
+                device_name,
+                None,
+                "confirm did not match the required phrase.",
+                f'Pass confirm="{_CLEAN_CONFIRM_PHRASE}" to run for real, or leave dry_run=True.',
+            ),
+            indent=2,
+        )
 
     try:
         result = await _run_in_executor(_execute_clean_device, device_name, commands, 300)
-        _log_op("pyats_clean_device", device_name, "clean_execute_command",
-                result.get("status", "error"), result.get("error"))
+        _log_op(
+            "pyats_clean_device",
+            device_name,
+            "clean_execute_command",
+            result.get("status", "error"),
+            result.get("error"),
+        )
         return json.dumps(result, indent=2)
     except Exception as exc:
         logger.error("pyats_clean_device failed: %s", exc, exc_info=True)
@@ -2214,6 +2567,7 @@ async def pyats_clean_device(
 # ===========================================================================
 # TESTING TOOL
 # ===========================================================================
+
 
 @mcp.tool()
 async def pyats_run_dynamic_test(test_script_content: str) -> str:
@@ -2243,15 +2597,21 @@ async def pyats_run_dynamic_test(test_script_content: str) -> str:
           "report": {...}, "artifacts_dir": "/path/to/run_dir" }
     """
     if not (test_script_content or "").strip():
-        return json.dumps(_err("pyats_run_dynamic_test", None, None,
-                               "Empty test script content."), indent=2)
+        return json.dumps(
+            _err("pyats_run_dynamic_test", None, None, "Empty test script content."), indent=2
+        )
     reason = reject_unsafe_script(test_script_content)
     if reason:
         return json.dumps(_err("pyats_run_dynamic_test", None, None, reason), indent=2)
     try:
         result = await _run_in_executor(_run_test_script, test_script_content, 300)
-        _log_op("pyats_run_dynamic_test", None, "dynamic_test",
-                result.get("status", "error"), result.get("error"))
+        _log_op(
+            "pyats_run_dynamic_test",
+            None,
+            "dynamic_test",
+            result.get("status", "error"),
+            result.get("error"),
+        )
         return json.dumps(result, indent=2)
     except Exception as exc:
         logger.error("pyats_run_dynamic_test failed: %s", exc, exc_info=True)
@@ -2329,12 +2689,17 @@ def _run_blitz(actions_yaml: str, device_names: List[str], timeout_s: int = 300)
         try:
             sections = yaml.safe_load(actions_yaml)
         except Exception as exc:
-            return {"status": "error", "error": f"actions_yaml is not valid YAML: {exc}",
-                    "artifacts_dir": str(run_dir)}
+            return {
+                "status": "error",
+                "error": f"actions_yaml is not valid YAML: {exc}",
+                "artifacts_dir": str(run_dir),
+            }
         if not isinstance(sections, list):
-            return {"status": "error",
-                    "error": "actions_yaml must parse to a YAML list (Blitz test_sections).",
-                    "artifacts_dir": str(run_dir)}
+            return {
+                "status": "error",
+                "error": "actions_yaml must parse to a YAML list (Blitz test_sections).",
+                "artifacts_dir": str(run_dir),
+            }
 
         trigger_doc = {
             _BLITZ_TRIGGER_NAME: {
@@ -2347,18 +2712,29 @@ def _run_blitz(actions_yaml: str, device_names: List[str], timeout_s: int = 300)
         job_path.write_text(
             "from genie.harness.main import gRun\n"
             "def main(runtime):\n"
-            f"    gRun(trigger_datafile=r'{trigger_path}', trigger_uids=['{_BLITZ_TRIGGER_NAME}'])\n",
+            f"    gRun(trigger_datafile=r'{trigger_path}', "
+            f"trigger_uids=['{_BLITZ_TRIGGER_NAME}'])\n",
             encoding="utf-8",
         )
         scoped_testbed_path = _build_scoped_testbed(device_names, run_dir)
 
-        cmd = [shutil.which("pyats") or "pyats", "run", "job", str(job_path),
-               "--testbed-file", scoped_testbed_path, "--no-mail"]
+        cmd = [
+            shutil.which("pyats") or "pyats",
+            "run",
+            "job",
+            str(job_path),
+            "--testbed-file",
+            scoped_testbed_path,
+            "--no-mail",
+        ]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
         except subprocess.TimeoutExpired:
-            return {"status": "error", "error": f"blitz job timed out after {timeout_s}s",
-                    "artifacts_dir": str(run_dir)}
+            return {
+                "status": "error",
+                "error": f"blitz job timed out after {timeout_s}s",
+                "artifacts_dir": str(run_dir),
+            }
 
         report_info = _extract_job_report(proc.stdout)
         payload = {
@@ -2411,17 +2787,29 @@ async def pyats_run_blitz(actions_yaml: str, device_names: List[str]) -> str:
     if not (actions_yaml or "").strip():
         return json.dumps(_err("pyats_run_blitz", None, None, "actions_yaml is empty."), indent=2)
     if not device_names:
-        return json.dumps(_err("pyats_run_blitz", None, None,
-                               "device_names is empty.",
-                               "Call pyats_list_devices to get valid names."), indent=2)
+        return json.dumps(
+            _err(
+                "pyats_run_blitz",
+                None,
+                None,
+                "device_names is empty.",
+                "Call pyats_list_devices to get valid names.",
+            ),
+            indent=2,
+        )
     guard = _blitz_guardrails(actions_yaml)
     if guard:
         return json.dumps(_err("pyats_run_blitz", None, None, guard), indent=2)
 
     try:
         result = await _run_in_executor(_run_blitz, actions_yaml, device_names, 300)
-        _log_op("pyats_run_blitz", ",".join(device_names), "blitz",
-                result.get("status", "error"), result.get("error"))
+        _log_op(
+            "pyats_run_blitz",
+            ",".join(device_names),
+            "blitz",
+            result.get("status", "error"),
+            result.get("error"),
+        )
         return json.dumps(result, indent=2)
     except Exception as exc:
         logger.error("pyats_run_blitz failed: %s", exc, exc_info=True)
@@ -2442,6 +2830,7 @@ async def pyats_run_blitz(actions_yaml: str, device_names: List[str]) -> str:
 # 'Parse "${parser}" on device "${device}"', 'Learn "${feature}" on device
 # "${device}"'.
 # ===========================================================================
+
 
 def _robot_guardrails(script: str) -> Optional[str]:
     """Best-effort denylist scan over raw Robot script text, same spirit as _config_guardrails."""
@@ -2477,8 +2866,11 @@ def _run_robot_script(script_content: str, timeout_s: int = 300) -> Dict[str, An
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
         except subprocess.TimeoutExpired:
-            return {"status": "error", "error": f"robot run timed out after {timeout_s}s",
-                    "artifacts_dir": str(run_dir)}
+            return {
+                "status": "error",
+                "error": f"robot run timed out after {timeout_s}s",
+                "artifacts_dir": str(run_dir),
+            }
 
         payload = {
             "status": "completed",
@@ -2551,14 +2943,21 @@ async def pyats_run_robot(robot_script_content: str) -> str:
           "artifacts_dir": "...", "paths": {"output_xml": "...", ...} }
     """
     if not (robot_script_content or "").strip():
-        return json.dumps(_err("pyats_run_robot", None, None, "robot_script_content is empty."), indent=2)
+        return json.dumps(
+            _err("pyats_run_robot", None, None, "robot_script_content is empty."), indent=2
+        )
     guard = _robot_guardrails(robot_script_content)
     if guard:
         return json.dumps(_err("pyats_run_robot", None, None, guard), indent=2)
     try:
         result = await _run_in_executor(_run_robot_script, robot_script_content, 300)
-        _log_op("pyats_run_robot", None, "robot_suite",
-                result.get("status", "error"), result.get("error"))
+        _log_op(
+            "pyats_run_robot",
+            None,
+            "robot_suite",
+            result.get("status", "error"),
+            result.get("error"),
+        )
         return json.dumps(result, indent=2)
     except Exception as exc:
         logger.error("pyats_run_robot failed: %s", exc, exc_info=True)
@@ -2588,13 +2987,17 @@ def _execute_xpresso_request(
     timeout: int = 30,
 ) -> Dict[str, Any]:
     if not XPRESSO_URL or not XPRESSO_API_TOKEN or not XPRESSO_GROUP:
-        return {"status": "error",
-                "error": "XPresso is not configured — set XPRESSO_URL, XPRESSO_API_TOKEN, "
-                         "and XPRESSO_GROUP in .env."}
+        return {
+            "status": "error",
+            "error": "XPresso is not configured — set XPRESSO_URL, XPRESSO_API_TOKEN, "
+            "and XPRESSO_GROUP in .env.",
+        }
     method_u = (method or "").upper()
     if method_u not in _XPRESSO_METHODS:
-        return {"status": "error",
-                "error": f"Unsupported method '{method}'. Use one of {sorted(_XPRESSO_METHODS)}."}
+        return {
+            "status": "error",
+            "error": f"Unsupported method '{method}'. Use one of {sorted(_XPRESSO_METHODS)}.",
+        }
 
     url = f"{XPRESSO_URL}{path if path.startswith('/') else '/' + path}"
     headers = {
@@ -2603,16 +3006,23 @@ def _execute_xpresso_request(
     }
     try:
         resp = requests.request(
-            method_u, url, headers=headers, params=params,
-            json=payload if payload is not None else None, timeout=timeout,
+            method_u,
+            url,
+            headers=headers,
+            params=params,
+            json=payload if payload is not None else None,
+            timeout=timeout,
         )
         try:
             body: Any = resp.json()
         except ValueError:
             body = resp.text
         return {
-            "status": "completed", "method": method_u, "url": url,
-            "status_code": resp.status_code, "body": body,
+            "status": "completed",
+            "method": method_u,
+            "url": url,
+            "status_code": resp.status_code,
+            "body": body,
         }
     except Exception as exc:
         return {"status": "error", "method": method_u, "url": url, "error": str(exc)}
@@ -2656,9 +3066,16 @@ async def pyats_xpresso_request(
     if not (path or "").strip():
         return json.dumps(_err("pyats_xpresso_request", None, path, "path is empty."), indent=2)
     try:
-        result = await _run_in_executor(_execute_xpresso_request, method, path, payload, params, timeout)
-        _log_op("pyats_xpresso_request", None, f"{method} {path}",
-                result.get("status", "error"), result.get("error"))
+        result = await _run_in_executor(
+            _execute_xpresso_request, method, path, payload, params, timeout
+        )
+        _log_op(
+            "pyats_xpresso_request",
+            None,
+            f"{method} {path}",
+            result.get("status", "error"),
+            result.get("error"),
+        )
         return json.dumps(result, indent=2)
     except Exception as exc:
         logger.error("pyats_xpresso_request failed: %s", exc, exc_info=True)
@@ -2668,6 +3085,7 @@ async def pyats_xpresso_request(
 # ===========================================================================
 # SESSION / AUDIT TOOL
 # ===========================================================================
+
 
 @mcp.tool()
 async def pyats_get_operation_log(
@@ -2715,14 +3133,17 @@ async def pyats_get_operation_log(
         total_entries = len(_OP_LOG)
     if device_filter:
         entries = [e for e in entries if e.get("device") == device_filter]
-    entries = entries[-min(limit, _OP_LOG_MAX):]
-    return json.dumps({
-        "status": "completed",
-        "total_entries": total_entries,
-        "returned": len(entries),
-        "filter_device": device_filter,
-        "log": entries,
-    }, indent=2)
+    entries = entries[-min(limit, _OP_LOG_MAX) :]
+    return json.dumps(
+        {
+            "status": "completed",
+            "total_entries": total_entries,
+            "returned": len(entries),
+            "filter_device": device_filter,
+            "log": entries,
+        },
+        indent=2,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2740,9 +3161,7 @@ async def pyats_get_operation_log(
 # ---------------------------------------------------------------------------
 _TRANSPORT_MODE: str = os.getenv("PYATS_MCP_TRANSPORT_MODE", "stateful").strip().lower()
 if _TRANSPORT_MODE not in ("stateful", "stateless"):
-    logger.warning(
-        "Invalid PYATS_MCP_TRANSPORT_MODE=%r; defaulting to 'stateful'", _TRANSPORT_MODE
-    )
+    logger.warning("Invalid PYATS_MCP_TRANSPORT_MODE=%r; defaulting to 'stateful'", _TRANSPORT_MODE)
     _TRANSPORT_MODE = "stateful"
 
 _HTTP_HOST: str = os.getenv("PYATS_MCP_HTTP_HOST", "0.0.0.0")
@@ -2751,7 +3170,9 @@ _HTTP_PORT: int = _parse_int_env("PYATS_MCP_HTTP_PORT", 8080)
 if __name__ == "__main__":
     logger.info(
         "Starting pyATS MCP Server — transport=streamable-http mode=%s host=%s port=%d",
-        _TRANSPORT_MODE, _HTTP_HOST, _HTTP_PORT,
+        _TRANSPORT_MODE,
+        _HTTP_HOST,
+        _HTTP_PORT,
     )
     mcp.run(
         transport="streamable-http",

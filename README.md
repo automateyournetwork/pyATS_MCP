@@ -11,7 +11,7 @@ Point an agent at it and it can look up a device, run and parse a show command, 
 
 ## At a glance
 
-- **Transport** — Streamable HTTP (`mcp>=2.0.0`), stateful or stateless, chosen with one environment variable. STDIO is gone.
+- **Transport** — Streamable HTTP (`mcp>=2.3.0`), stateful or stateless, chosen with one environment variable. STDIO is gone.
 - **26 tools** across discovery, show commands, configuration, Genie learn/diff, Genie Clean, declarative testing (Blitz, Robot Framework, AEtest), generic REST/RESTCONF, and Cisco XPresso.
 - **Two ways to fan out** a command across many devices — a shared thread pool for everyday use, or one OS process per device (`pyats.async_.pcall`) when you want real isolation at scale.
 - **Guardrails, not honor systems** — dangerous commands are blocked before they reach a device, Genie Clean can never run a stage that reboots or reimages one, and destructive actions require an exact confirmation phrase.
@@ -78,7 +78,7 @@ XPRESSO_API_TOKEN=
 XPRESSO_GROUP=
 ```
 
-`PYATS_MCP_TRANSPORT_MODE=stateless` sets `stateless_http=True` on the Streamable HTTP transport, so no server-side session state is retained between requests from clients still negotiating the older, handshake-based protocol. Clients speaking the current MCP protocol (2026-07-28, SEP-2575) are handshake-free by default regardless of this setting — that comes from the `mcp>=2.0.0` SDK itself, not anything configured here.
+`PYATS_MCP_TRANSPORT_MODE=stateless` sets `stateless_http=True` on the Streamable HTTP transport, so no server-side session state is retained between requests from clients still negotiating the older, handshake-based protocol. Clients speaking the current MCP protocol (2026-07-28, SEP-2575) are handshake-free by default regardless of this setting — that comes from the `mcp>=2.3.0` SDK itself, not anything configured here.
 
 ### 3. Add a block for each device
 
@@ -258,6 +258,89 @@ async def main():
 ```
 
 ---
+
+## Asynchronous MCP Tasks
+
+MCP supports returning a task handle immediately and retrieving the result later.
+This server implements the **2026-07-28 `io.modelcontextprotocol/tasks` extension**
+using the Python SDK's extension hooks (`mcp>=2.3.0`). It does not implement the
+older experimental 2025-11-25 `tasks/result` / `tasks/list` protocol.
+See the [Tasks specification](https://tasks.extensions.modelcontextprotocol.io/specification/2026-07-28/tasks)
+and [Python SDK extension API](https://py.sdk.modelcontextprotocol.io/advanced/extensions/).
+
+All 22 device I/O, remote request and test execution tools use tasks when the client
+advertises this extension on the request. Device inventory/search, snapshot diffs,
+and operation history remain immediate. Existing clients that do not advertise
+Tasks keep the ordinary tool result behavior. Client support must match this
+extension; merely supporting the older experimental Tasks API is insufficient.
+
+The initial `tools/call` request includes this metadata (alongside `name` and `arguments`):
+
+```json
+{
+  "_meta": {
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientCapabilities": {
+      "extensions": {"io.modelcontextprotocol/tasks": {}}
+    }
+  }
+}
+```
+
+The response has `resultType: "task"`, `taskId`, `status: "working"`, timestamps,
+and `pollIntervalMs`. Poll `tasks/get` with `{"taskId": "..."}` and the same metadata.
+Its response has `resultType: "complete"`; inspect **status** to determine whether
+the work has finished. A completed task contains the original MCP tool response in
+`result`. A protocol failure uses `status: "failed"` and `error`; a tool error still
+uses `status: "completed"` and preserves the tool's error payload. HTTP requests use
+`Mcp-Method` and `Mcp-Name` headers; for task methods `Mcp-Name` is the task ID.
+
+Run the [example polling client](examples/task_client.py):
+
+```bash
+python examples/task_client.py http://localhost:8080/mcp pyats_run_show_command \
+  '{"device_name":"router-1","command":"show version"}'
+```
+
+`tasks/cancel` acknowledges cancellation intent. Queued work is cancelled before
+execution. Once a tool starts, it finishes and retains its result: cancelling an
+await cannot safely stop an SSH command, reverse a configuration change, or kill
+a test subprocess. `tasks/update` acknowledges and ignores input response keys;
+these tools do not request interactive input. Notifications are not implemented;
+clients use polling and honor `pollIntervalMs` (1 second).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PYATS_MCP_TASK_DB` | `<artifacts directory>/tasks.sqlite3` | Persistent task/result store |
+| `PYATS_MCP_TASK_WORKERS` | `4` | Maximum simultaneous long-running tool calls |
+| `PYATS_MCP_TASK_MAX` | `1000` | Maximum retained tasks, including queued/running tasks |
+| `PYATS_MCP_TASK_RETENTION` | `86400` | Seconds to retain terminal results |
+
+The worker limit applies to ordinary calls too. Multi-device tools retain their
+internal fan-out. Calls targeting the same device are serialized for the full tool
+operation, including config snapshots and diffs; independent devices can execute
+concurrently. Dynamic Python/Robot tests reserve all testbed devices. Scripts that
+connect to devices outside the supplied testbed remain responsible for their own
+concurrency. Connection TTL eviction occurs when that device is next used.
+
+Tasks survive HTTP disconnects in both stateful and stateless modes. SQLite commits
+the handle before returning it and preserves terminal results across restarts.
+Running tasks have `ttlMs: null`; completion sets a TTL measured from creation that
+includes the retention period. Expired results are removed on subsequent task
+submission. Admission is rejected when the retained-task limit is reached.
+On restart, unfinished tasks become failed with an unknown-outcome message; they
+are **never automatically replayed**. Inspect device state before retrying changes.
+Graceful shutdown cancels queued tasks and drains active operations.
+
+Run **one server process per task database**; a file lock enforces this. For Docker,
+mount a persistent directory and point `PYATS_MCP_TASK_DB` into it. Horizontal
+replicas require separate stores and routing each task ID back to its owning
+replica. This implementation is not a distributed task queue.
+
+The database contains tool results, potentially including configurations, and is
+created with owner-only permissions. Authenticated tasks are bound to the verified
+client/issuer/subject identity. With this project's default unauthenticated server,
+the unguessable task ID acts as a bearer credential; protect it and the database.
 
 ## What To Ask It
 
