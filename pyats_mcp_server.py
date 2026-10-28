@@ -47,9 +47,11 @@ from dotenv import load_dotenv
 from genie.libs.parser.utils import get_parser
 from genie.utils.diff import Diff
 from mcp.server.mcpserver import MCPServer
+from mcp.types import ToolAnnotations
 from pyats.async_ import pcall
 from pyats.topology import loader
 
+import pyats_testbed_builder as tbb
 from pyats_tasks import PyatsTasks
 
 # ---------------------------------------------------------------------------
@@ -68,11 +70,18 @@ logger = logging.getLogger("PyatsMCPServer")
 load_dotenv()
 
 TESTBED_PATH: str = os.getenv("PYATS_TESTBED_PATH", "")
+# A static testbed file is the default; PYATS_MCP_DYNAMIC_ONLY=1 lets the
+# server start with none and require pyats_testbed_build + pyats_testbed_activate.
+_DYNAMIC_ONLY: bool = os.getenv("PYATS_MCP_DYNAMIC_ONLY", "0") == "1"
 if not TESTBED_PATH or not os.path.exists(TESTBED_PATH):
-    logger.critical("PYATS_TESTBED_PATH not set or file not found: %s", TESTBED_PATH)
-    sys.exit(1)
+    if _DYNAMIC_ONLY:
+        TESTBED_PATH = ""
+        logger.warning("PYATS_MCP_DYNAMIC_ONLY=1 and no static testbed; build one with pyats_testbed_build")
+    else:
+        logger.critical("PYATS_TESTBED_PATH not set or file not found: %s", TESTBED_PATH)
+        sys.exit(1)
 
-logger.info("Using testbed: %s", TESTBED_PATH)
+logger.info("Using testbed: %s", TESTBED_PATH or "<dynamic only>")
 
 # Artifact storage for dynamic test runs
 ARTIFACTS_DIR: Path = Path(
@@ -214,8 +223,32 @@ def _err(
 # ---------------------------------------------------------------------------
 
 
+# Dynamic (in-memory) testbeds built by pyats_testbed_build. When one is
+# activated every tool below transparently operates on it instead of the
+# static PYATS_TESTBED_PATH file.
+_dynamic_testbeds = tbb.TestbedRegistry(ARTIFACTS_DIR / "dynamic_testbeds")
+
+
+def _active_testbed_path() -> str:
+    """Path of the active testbed for subprocess tools (materialized on demand)."""
+    entry = _dynamic_testbeds.active_entry()
+    if entry is not None:
+        return _dynamic_testbeds.materialize(entry)
+    if not TESTBED_PATH:
+        raise RuntimeError("No active testbed. Build one with pyats_testbed_build and activate it.")
+    return TESTBED_PATH
+
+
 def _load_testbed():
-    """Return the cached testbed, reloading from disk when the TTL has expired."""
+    """Return the active testbed: a dynamic one if activated, else the cached static file."""
+    entry = _dynamic_testbeds.active_entry()
+    if entry is not None:
+        with _STATE_LOCK:
+            if entry.loaded is None:
+                entry.loaded = loader.load(json.loads(json.dumps(entry.raw)))
+            return entry.loaded
+    if not TESTBED_PATH:
+        raise RuntimeError("No active testbed. Build one with pyats_testbed_build and activate it.")
     with _STATE_LOCK:
         now = time.time()
         if _testbed_cache["tb"] is None or (now - _testbed_cache["loaded_at"]) > _TESTBED_CACHE_TTL:
@@ -978,7 +1011,7 @@ def _run_test_script(script_content: str, timeout_s: int = 300) -> Dict[str, Any
                 cmd,
                 capture_output=True,
                 text=True,
-                env={**os.environ, "PYATS_TESTBED_PATH": TESTBED_PATH},
+                env={**os.environ, "PYATS_TESTBED_PATH": _active_testbed_path()},
                 timeout=timeout_s,
             )
         except subprocess.TimeoutExpired:
@@ -2430,7 +2463,7 @@ def _execute_clean_device(
             shutil.which("pyats") or "pyats",
             "clean",
             "--testbed-file",
-            TESTBED_PATH,
+            _active_testbed_path(),
             "--clean-file",
             str(clean_path),
             "--clean-devices",
@@ -2664,7 +2697,7 @@ def _build_scoped_testbed(device_names: List[str], run_dir: Path) -> str:
     still happens normally when the scoped file is loaded by the
     subprocess, which inherits this process's environment).
     """
-    with open(TESTBED_PATH, "r", encoding="utf-8") as f:
+    with open(_active_testbed_path(), "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     all_devices = raw.get("devices", {}) or {}
     raw["devices"] = {name: all_devices[name] for name in device_names if name in all_devices}
@@ -2859,7 +2892,7 @@ def _run_robot_script(script_content: str, timeout_s: int = 300) -> Dict[str, An
     suite_path = run_dir / "suite.robot"
 
     try:
-        rendered = script_content.replace("{{TESTBED_PATH}}", TESTBED_PATH)
+        rendered = script_content.replace("{{TESTBED_PATH}}", _active_testbed_path())
         suite_path.write_text(rendered, encoding="utf-8")
 
         cmd = [shutil.which("robot") or "robot", "--outputdir", str(run_dir), str(suite_path)]
@@ -3144,6 +3177,540 @@ async def pyats_get_operation_log(
         },
         indent=2,
     )
+
+
+# ===========================================================================
+# DYNAMIC TESTBED TOOLS
+#
+# Build pyATS testbeds in memory from any inventory source (Itential
+# Inventory Manager, NetBox, Nautobot, Catalyst Center, CSV/JSON/YAML/XML,
+# generic REST) and switch every other tool onto them — no testbed.yaml
+# round-trip. Device credentials are always %ENV{} references; secrets never
+# pass through tool arguments or results.
+# ===========================================================================
+
+_RO = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
+_RO_REMOTE = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True)
+_BUILD = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True)
+_STATEFUL = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
+_DELETE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False)
+
+
+def _static_raw() -> Dict[str, Any]:
+    if not TESTBED_PATH:
+        raise tbb.TestbedBuildError("no static testbed is configured (PYATS_TESTBED_PATH is unset)")
+    with open(TESTBED_PATH, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _set_active_testbed(name: Optional[str]) -> None:
+    """Switch the active testbed and drop connections that belonged to the old one."""
+    _dynamic_testbeds.activate(name)
+    with _STATE_LOCK:
+        stale = list(_conn_cache.values())
+        _conn_cache.clear()
+        _testbed_cache["tb"] = None
+    for entry in stale:
+        dev = entry.get("device")
+        try:
+            if dev and getattr(dev, "is_connected", lambda: False)():
+                dev.disconnect()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Error disconnecting during testbed switch: %s", exc)
+
+
+def _device_rows(raw: Dict[str, Any], offset: int, limit: int) -> List[Dict[str, Any]]:
+    rows = []
+    for name in list(raw.get("devices", {}))[offset : offset + limit]:
+        dev = raw["devices"][name]
+        conns = dev.get("connections") or {}
+        via = (conns.get("defaults") or {}).get("via") or next((k for k in conns if k != "defaults"), None)
+        c = conns.get(via) or {}
+        rows.append(
+            {
+                "name": name,
+                "os": dev.get("os"),
+                "type": dev.get("type"),
+                "ip": c.get("ip") or c.get("host"),
+                "port": c.get("port"),
+                "protocol": c.get("protocol"),
+                "tags": (dev.get("custom") or {}).get("tags"),
+            }
+        )
+    return rows
+
+
+def _testbed_summary(entry: "tbb.Entry") -> Dict[str, Any]:
+    devs = entry.raw.get("devices", {})
+    os_counts: Dict[str, int] = {}
+    for d in devs.values():
+        os_counts[d.get("os", "?")] = os_counts.get(d.get("os", "?"), 0) + 1
+    return {
+        "name": entry.name,
+        "devices": len(devs),
+        "os_counts": os_counts,
+        "source": entry.source,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(entry.created)),
+        "active": _dynamic_testbeds.active_name == entry.name,
+    }
+
+
+def _fetch_records(
+    source: str,
+    inventory: Optional[Union[str, List[str]]],
+    profile: Optional[str],
+    data: Optional[Any],
+    file_path: Optional[str],
+    fmt: Optional[str],
+    rest: Optional[Dict[str, Any]],
+    records_path: Optional[str],
+    max_devices: int,
+) -> List[Dict[str, Any]]:
+    """Blocking: fetch + normalize source records. Runs in the executor."""
+    if source == "itential_inventory":
+        invs = [inventory] if isinstance(inventory, str) else list(inventory or [])
+        if not invs:
+            raise tbb.TestbedBuildError(
+                "inventory is required for source='itential_inventory'; call pyats_testbed_source_inventories to list them"
+            )
+        return tbb.fetch_itential(invs, profile, max_devices)
+    if source == "catalyst_center":
+        return tbb.extract_records({"response": tbb.fetch_catalyst_center(max_devices)}, "response")
+    if source in ("netbox", "nautobot"):
+        return tbb.extract_records({"results": tbb.fetch_token_api(source, max_devices)}, "results")
+    if source == "inline":
+        if not data:
+            raise tbb.TestbedBuildError("data is required for source='inline'")
+        # MCP clients may hand structured JSON over as an object/array, not text.
+        parsed = data if isinstance(data, (list, dict)) else tbb.parse_payload(data, fmt)
+        return tbb.extract_records(parsed, records_path)
+    if source == "file":
+        if not file_path:
+            raise tbb.TestbedBuildError("file_path is required for source='file'")
+        dirs = tbb.allowed_dirs([ARTIFACTS_DIR] + ([Path(TESTBED_PATH).parent] if TESTBED_PATH else []))
+        return tbb.extract_records(tbb.parse_payload(tbb.read_source_file(file_path, dirs), fmt), records_path)
+    if source == "rest":
+        r = dict(rest or {})
+        if not r.get("url"):
+            raise tbb.TestbedBuildError("rest.url is required for source='rest'")
+        return tbb.fetch_rest(
+            r["url"],
+            params=r.get("params"),
+            headers_env=r.get("headers_env"),
+            pagination=r.get("pagination"),
+            records_path=records_path,
+            max_records=max_devices,
+            verify_tls=bool(r.get("verify_tls", True)),
+        )
+    raise tbb.TestbedBuildError(
+        f"unknown source {source!r}; use itential_inventory, netbox, nautobot, catalyst_center, inline, file or rest"
+    )
+
+
+@mcp.tool(annotations=_RO)
+async def pyats_testbed_sources() -> str:
+    """
+    Show which testbed sources this server can build from, and the active testbed.
+
+    WHEN TO USE:
+      Call first when asked to build a testbed dynamically. It tells you which
+      sources are configured on the server (credentials live in server env
+      vars, never in tool arguments), which Itential profiles exist, and
+      which hosts/directories the generic rest/file sources may touch.
+
+    Returns:
+        {"status": "completed", "active": "<name>|static|none",
+         "sources": {...}, "itential_profiles": [...], "mapping_presets": [...]}
+    """
+    try:
+        e = os.environ
+        profiles = sorted(
+            {m.group(1).lower() for k in e if (m := re.match(r"^ITENTIAL_([A-Z0-9_]+)_URL$", k)) and e[k]}
+        )
+        active = _dynamic_testbeds.active_name or ("static" if TESTBED_PATH else "none")
+        payload = {
+            "status": "completed",
+            "active": active,
+            "dynamic_testbeds": _dynamic_testbeds.names(),
+            "sources": {
+                "itential_inventory": {
+                    "configured": bool(e.get("PLATFORM_URL")) or bool(profiles),
+                    "default_platform": e.get("PLATFORM_URL", "").split("//")[-1] or None,
+                },
+                "netbox": {"configured": bool(e.get("NETBOX_URL") and e.get("NETBOX_TOKEN"))},
+                "nautobot": {"configured": bool(e.get("NAUTOBOT_URL") and e.get("NAUTOBOT_TOKEN"))},
+                "catalyst_center": {
+                    "configured": bool(e.get("CATALYST_CENTER_URL") and e.get("CATALYST_CENTER_USERNAME"))
+                },
+                "inline": {"configured": True, "formats": ["csv", "json", "yaml", "xml"]},
+                "file": {"configured": True, "allowed_dirs": [str(p) for p in tbb.allowed_dirs([ARTIFACTS_DIR])]},
+                "rest": {"configured": True, "allowed_hosts": sorted(tbb.allowed_hosts())},
+            },
+            "itential_profiles": profiles,
+            "mapping_presets": sorted(tbb.PRESETS),
+        }
+        _log_op("pyats_testbed_sources", None, "list", "completed")
+        return json.dumps(payload, indent=2)
+    except Exception as exc:
+        logger.error("pyats_testbed_sources failed: %s", exc, exc_info=True)
+        return json.dumps(_err("pyats_testbed_sources", None, None, str(exc)), indent=2)
+
+
+@mcp.tool(annotations=_RO_REMOTE)
+async def pyats_testbed_source_inventories(profile: Optional[str] = None) -> str:
+    """
+    List the Itential Inventory Manager inventories available as testbed sources.
+
+    WHEN TO USE:
+      Before pyats_testbed_build(source="itential_inventory") when you do not
+      know the inventory name. Shows node counts and tags so you can size and
+      filter the build.
+
+    Args:
+        profile: Optional named Itential Platform (reads ITENTIAL_<PROFILE>_URL
+                 etc.). Omit to use the default PLATFORM_URL.
+    """
+    try:
+        cl = tbb.ItentialClient(profile)
+        invs = await _run_in_executor(cl.list_inventories)
+        return json.dumps(
+            {
+                "status": "completed",
+                "platform": cl.cfg["URL"].split("//")[-1],
+                "inventories": [
+                    {
+                        "name": i["name"],
+                        "nodes": i.get("nodeCount"),
+                        "tags": i.get("tags", [])[:10],
+                        "tags_total": len(i.get("tags", [])),
+                        "description": i.get("description", ""),
+                    }
+                    for i in invs
+                ],
+            },
+            indent=2,
+        )
+    except tbb.TestbedBuildError as exc:
+        return json.dumps(_err("pyats_testbed_source_inventories", None, None, str(exc)), indent=2)
+    except Exception as exc:
+        logger.error("pyats_testbed_source_inventories failed: %s", exc, exc_info=True)
+        return json.dumps(
+            _err(
+                "pyats_testbed_source_inventories",
+                None,
+                None,
+                f"{type(exc).__name__}: {exc}",
+                "Check the Platform URL/credentials configured on the server.",
+            ),
+            indent=2,
+        )
+
+
+@mcp.tool(annotations=_BUILD)
+async def pyats_testbed_build(
+    name: str,
+    source: str = "itential_inventory",
+    inventory: Optional[Union[str, List[str]]] = None,
+    profile: Optional[str] = None,
+    data: Optional[Any] = None,
+    file_path: Optional[str] = None,
+    format: str = "auto",
+    rest: Optional[Dict[str, Any]] = None,
+    preset: Optional[str] = None,
+    records_path: Optional[str] = None,
+    mapping: Optional[Dict[str, Any]] = None,
+    filters: Optional[Dict[str, Any]] = None,
+    tags: Optional[List[str]] = None,
+    os_map: Optional[Dict[str, str]] = None,
+    default_os: Optional[str] = None,
+    default_protocol: str = "ssh",
+    default_port: int = 22,
+    credentials: Optional[Dict[str, Any]] = None,
+    max_devices: int = 5000,
+    merge_with: Optional[str] = None,
+    activate: bool = False,
+    dry_run: bool = False,
+) -> str:
+    """
+    Build a pyATS testbed in memory from an inventory source and (optionally)
+    make every other tool use it. No YAML file is written.
+
+    SOURCES (source=):
+      itential_inventory  Itential Inventory Manager (set inventory=<name or list>;
+                          profile=<name> picks a non-default Platform, e.g. devstack)
+      netbox / nautobot   DCIM devices via NETBOX_URL/NETBOX_TOKEN (server env)
+      catalyst_center     Network devices via CATALYST_CENTER_URL/_USERNAME/_PASSWORD
+      inline              csv/json/yaml/xml text in `data` (format auto-detected)
+      file                a file under an allowed source directory (file_path)
+      rest                any JSON REST API: rest={"url":..., "params":{...},
+                          "headers_env":{"Authorization":"ENV_VAR_NAME"},
+                          "pagination":{"type":"next_url|offset|page", ...}}
+                          Host must be allowed (see pyats_testbed_sources).
+
+    MAPPING (how a record becomes a device) — presets cover the named sources;
+    for inline/file/rest set preset=<name> (e.g. "netbox") or pass mapping:
+      {"name":"hostname", "ip":"mgmt.address", "os":"platform",
+       "port":"ssh_port", "type":"role", "platform":..., "model":..., "series":...,
+       "custom":{"site":"site.name"}}
+    Each value is a dotted path ("a.b[0].c", "tags[*].slug"), a template
+    ("{site}-{name}"), "literal:xyz", or {"path":..,"map":{..},"default":..,"regex":..}.
+    `os` values are normalized to pyATS names (IOS-XE->iosxe, NX-OS->nxos,
+    frr->linux, ...); use os_map={"vendor value":"pyats os"} for others, or
+    default_os when the source has no platform field.
+
+    FILTERS: filters={"include":[{"field":"tags","contains":"leaf"}],
+      "exclude":[{"field":"os","equals":"x"}]}; ops: equals|in|contains|regex.
+    `tags` is shorthand for an include rule on the record's tags.
+
+    CREDENTIALS: never pass secrets. Devices reference server env vars:
+      credentials={"username_env":"LAB_USER","password_env":"LAB_PASS","enable_env":"LAB_ENABLE"}
+      (defaults PYATS_DEVICE_USERNAME/_PASSWORD/_ENABLE_PASSWORD) or
+      credentials={"from":"static"} to reuse the static testbed's credentials block.
+
+    MODES: dry_run=True previews without storing. merge_with="static" (or the
+    name of another dynamic testbed) adds those devices too (existing names win).
+    activate=True switches all tools to this testbed immediately; otherwise
+    call pyats_testbed_activate. Existing device connections are dropped on a
+    switch. Run pyats_testbed_validate afterwards (optionally with reachability).
+
+    Returns a summary: devices built/skipped (with reasons), OS counts, warnings,
+    unresolved credential env vars, and a sample of devices.
+    """
+    tool = "pyats_testbed_build"
+    try:
+        if not tbb.NAME_RE.match(name):
+            raise tbb.TestbedBuildError("name must match [A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+        max_devices = max(1, min(int(max_devices), 20000))
+        preset_name = preset or (source if source in tbb.PRESETS else "generic")
+        if preset_name not in tbb.PRESETS:
+            raise tbb.TestbedBuildError(f"unknown preset {preset_name!r}; choose from {sorted(tbb.PRESETS)}")
+        pre = tbb.PRESETS[preset_name]
+
+        merged_map = {**pre["mapping"], **(mapping or {})}
+        if mapping and "custom" in mapping and "custom" in pre["mapping"]:
+            merged_map["custom"] = {**pre["mapping"]["custom"], **mapping["custom"]}
+        flt: Dict[str, Any] = {
+            "include": list((pre.get("filters") or {}).get("include", [])) + list((filters or {}).get("include", [])),
+            "exclude": list((pre.get("filters") or {}).get("exclude", [])) + list((filters or {}).get("exclude", [])),
+        }
+        if tags:
+            flt["include"].append({"field": "tags", "in": list(tags)})
+
+        records = await _run_in_executor(
+            _fetch_records,
+            source,
+            inventory,
+            profile,
+            data,
+            file_path,
+            format,
+            rest,
+            records_path or pre.get("records_path"),
+            max_devices,
+        )
+        total_fetched = len(records)
+        records = tbb.apply_filters(records, flt)
+        if not records:
+            raise tbb.TestbedBuildError(f"{total_fetched} record(s) fetched but none passed the filters")
+
+        needs_static = (credentials or {}).get("from") == "static" or merge_with == "static"
+        static_raw = _static_raw() if needs_static else None
+        creds = tbb.build_credentials(credentials, static_raw)
+        raw, report = tbb.build_testbed(
+            records,
+            merged_map,
+            name=name,
+            credentials=creds,
+            os_map=os_map,
+            default_os=default_os,
+            default_protocol=default_protocol,
+            default_port=default_port,
+            max_devices=max_devices,
+        )
+        report["records_fetched"] = total_fetched
+
+        if merge_with:
+            base = static_raw if merge_with == "static" else _dynamic_testbeds.get(merge_with).raw
+            raw, clashes = tbb.merge_raw(base, raw, name)
+            report["merged_with"] = merge_with
+            report["name_clashes_kept_from_base"] = clashes[:20]
+
+        src_meta = {"source": source, "preset": preset_name, "inventory": inventory, "profile": profile}
+        if not dry_run:
+            entry = _dynamic_testbeds.put(name, raw, src_meta)
+            if activate:
+                _set_active_testbed(name)
+            summary = _testbed_summary(entry)
+        else:
+            summary = {"name": name, "devices": len(raw["devices"]), "stored": False}
+
+        unresolved = tbb.unresolved_env(raw)
+        warnings = list(report.get("warnings", []))
+        if unresolved:
+            warnings.append(
+                f"credential env var(s) not set on the server: {unresolved}. "
+                "Devices will fail to log in until they are set."
+            )
+        _log_op(tool, None, f"{source}:{inventory or ''}", "completed")
+        return json.dumps(
+            {
+                "status": "completed",
+                "testbed": summary,
+                "report": {**report, "warnings": warnings},
+                "unresolved_env": unresolved,
+                "sample_devices": _device_rows(raw, 0, 5),
+                "next_steps": (["pyats_testbed_activate(name)"] if not (activate or dry_run) else [])
+                + ["pyats_testbed_validate(name, check_reachability=True)"],
+            },
+            indent=2,
+        )
+    except tbb.TestbedBuildError as exc:
+        return json.dumps(_err(tool, None, source, str(exc)), indent=2)
+    except Exception as exc:
+        logger.error("%s failed: %s", tool, exc, exc_info=True)
+        return json.dumps(
+            _err(tool, None, source, f"{type(exc).__name__}: {exc}", "Check the source configuration on the server."),
+            indent=2,
+        )
+
+
+@mcp.tool(annotations=_RO)
+async def pyats_testbed_list() -> str:
+    """List the in-memory dynamic testbeds, which one is active, and the static testbed."""
+    try:
+        entries = [_testbed_summary(_dynamic_testbeds.get(n)) for n in _dynamic_testbeds.names()]
+        return json.dumps(
+            {
+                "status": "completed",
+                "active": _dynamic_testbeds.active_name or ("static" if TESTBED_PATH else "none"),
+                "static": {"path": TESTBED_PATH or None},
+                "dynamic": entries,
+            },
+            indent=2,
+        )
+    except Exception as exc:
+        return json.dumps(_err("pyats_testbed_list", None, None, str(exc)), indent=2)
+
+
+@mcp.tool(annotations=_RO)
+async def pyats_testbed_get(
+    name: str, device: Optional[str] = None, offset: int = 0, limit: int = 50, as_yaml: bool = False
+) -> str:
+    """
+    Inspect a dynamic testbed: a page of device rows, one device in full
+    (device=<name>), or the page as pyATS YAML (as_yaml=True). Contains only
+    %ENV{} credential references — never secrets.
+    """
+    try:
+        entry = _dynamic_testbeds.get(name)
+        raw = entry.raw
+        if device:
+            if device not in raw["devices"]:
+                raise tbb.TestbedBuildError(f"device {device!r} not in testbed {name!r}")
+            return json.dumps({"status": "completed", "device": device, "definition": raw["devices"][device]}, indent=2)
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+        if as_yaml:
+            page = {n: raw["devices"][n] for n in list(raw["devices"])[offset : offset + limit]}
+            doc = {"testbed": raw.get("testbed", {}), "devices": page}
+            return json.dumps(
+                {
+                    "status": "completed",
+                    "yaml": yaml.safe_dump(doc, sort_keys=False),
+                    "offset": offset,
+                    "limit": limit,
+                    "total_devices": len(raw["devices"]),
+                },
+                indent=2,
+            )
+        return json.dumps(
+            {
+                "status": "completed",
+                **_testbed_summary(entry),
+                "offset": offset,
+                "limit": limit,
+                "rows": _device_rows(raw, offset, limit),
+            },
+            indent=2,
+        )
+    except Exception as exc:
+        return json.dumps(_err("pyats_testbed_get", device, name, str(exc)), indent=2)
+
+
+@mcp.tool(annotations=_STATEFUL)
+async def pyats_testbed_activate(name: str) -> str:
+    """
+    Make a dynamic testbed the one every pyATS tool operates on (list devices,
+    show commands, configure, learn, ...). Use name="static" to return to the
+    PYATS_TESTBED_PATH testbed. Open device connections from the previous
+    testbed are closed.
+    """
+    try:
+        if name == "static":
+            if not TESTBED_PATH:
+                raise tbb.TestbedBuildError("no static testbed configured on this server")
+            _set_active_testbed(None)
+            devices = len(_load_testbed().devices)
+        else:
+            _set_active_testbed(name)
+            devices = len(_dynamic_testbeds.get(name).raw["devices"])
+        _log_op("pyats_testbed_activate", None, name, "completed")
+        return json.dumps({"status": "completed", "active": name, "devices": devices}, indent=2)
+    except Exception as exc:
+        return json.dumps(_err("pyats_testbed_activate", None, name, str(exc)), indent=2)
+
+
+@mcp.tool(annotations=_DELETE)
+async def pyats_testbed_delete(name: str) -> str:
+    """Delete an in-memory dynamic testbed (and its materialized file, if any). If it was active, the static testbed becomes active again."""
+    try:
+        was_active = _dynamic_testbeds.active_name == name
+        if was_active:
+            _set_active_testbed(None)
+        _dynamic_testbeds.delete(name)
+        _log_op("pyats_testbed_delete", None, name, "completed")
+        return json.dumps({"status": "completed", "deleted": name, "reverted_to_static": was_active}, indent=2)
+    except Exception as exc:
+        return json.dumps(_err("pyats_testbed_delete", None, name, str(exc)), indent=2)
+
+
+def _validate_testbed(name: str, devices: Optional[List[str]], check_reachability: bool) -> Dict[str, Any]:
+    entry = _dynamic_testbeds.get(name)
+    raw = entry.raw
+    result: Dict[str, Any] = {"status": "completed", "name": name, "devices": len(raw["devices"])}
+    try:
+        tb = loader.load(json.loads(json.dumps(raw)))
+        result["pyats_schema"] = f"ok ({len(tb.devices)} devices loaded)"
+    except Exception as exc:  # noqa: BLE001
+        result["pyats_schema"] = f"FAILED: {type(exc).__name__}: {exc}"
+        result["status"] = "invalid"
+    unresolved = tbb.unresolved_env(raw)
+    result["credential_env"] = {"referenced": tbb.env_refs(raw), "unset_on_server": unresolved}
+    if unresolved and result["status"] == "completed":
+        result["status"] = "warning"
+    if check_reachability:
+        result["reachability"] = tbb.tcp_probe(raw, devices)
+    return result
+
+
+@mcp.tool(annotations=_RO_REMOTE)
+async def pyats_testbed_validate(
+    name: str, check_reachability: bool = False, devices: Optional[List[str]] = None
+) -> str:
+    """
+    Validate a dynamic testbed: (1) it loads under the real pyATS schema,
+    (2) every %ENV{} credential variable is set on the server, and optionally
+    (3) a TCP connect to each device's management address/port (no login,
+    nothing sent). Use `devices` to probe a subset of a large testbed.
+    """
+    try:
+        res = await _run_in_executor(_validate_testbed, name, devices, check_reachability)
+        return json.dumps(res, indent=2)
+    except tbb.TestbedBuildError as exc:
+        return json.dumps(_err("pyats_testbed_validate", None, name, str(exc)), indent=2)
+    except Exception as exc:
+        logger.error("pyats_testbed_validate failed: %s", exc, exc_info=True)
+        return json.dumps(_err("pyats_testbed_validate", None, name, f"{type(exc).__name__}: {exc}"), indent=2)
 
 
 # ---------------------------------------------------------------------------

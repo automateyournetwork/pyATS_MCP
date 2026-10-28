@@ -32,7 +32,8 @@ EXTENSION_ID = "io.modelcontextprotocol/tasks"
 PROTOCOL = "2026-07-28"
 logger = logging.getLogger(__name__)
 
-# Inventory, local snapshot diffs and operation history remain immediate.
+# Inventory, local snapshot diffs, operation history and in-memory testbed
+# management remain immediate; testbed build/validate do network I/O.
 TASK_TOOLS = frozenset(
     {
         "pyats_run_show_command",
@@ -57,6 +58,8 @@ TASK_TOOLS = frozenset(
         "pyats_run_blitz",
         "pyats_run_robot",
         "pyats_xpresso_request",
+        "pyats_testbed_build",
+        "pyats_testbed_validate",
     }
 )
 

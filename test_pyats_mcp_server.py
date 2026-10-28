@@ -1325,3 +1325,144 @@ class TestPyatsXpressoRequest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+# Dynamic testbeds — server integration (builder logic is in
+# test_pyats_testbed_builder.py)
+# ---------------------------------------------------------------------------
+
+_CSV = "host,addr,nos\nr1,10.0.0.1,ios-xe\nr2,10.0.0.2,nx-os\n"
+_CSV_MAP = {"name": "host", "ip": "addr", "os": "nos"}
+
+
+class TestDynamicTestbeds(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = srv._dynamic_testbeds
+        srv._dynamic_testbeds = srv.tbb.TestbedRegistry(Path(self._tmp.name))
+        with srv._STATE_LOCK:
+            srv._testbed_cache["tb"] = None
+
+    def test_inline_accepts_structured_data(self):
+        recs = srv._fetch_records(
+            "inline", None, None, [{"h": "r1", "a": "10.0.0.1", "n": "ios"}],
+            None, "auto", None, None, 10,
+        )
+        self.assertEqual(recs[0]["h"], "r1")
+
+    def tearDown(self):
+        srv._dynamic_testbeds = self._orig
+        self._tmp.cleanup()
+
+    def _build(self, **kw):
+        args = dict(name="t1", source="inline", data=_CSV, mapping=_CSV_MAP)
+        args.update(kw)
+        return _json(_run(srv.pyats_testbed_build(**args)))
+
+    def test_build_stores_without_activating(self):
+        out = self._build()
+        assert out["status"] == "completed", out
+        assert out["testbed"]["devices"] == 2 and out["testbed"]["active"] is False
+        assert srv._dynamic_testbeds.active_entry() is None
+
+    def test_dry_run_stores_nothing(self):
+        out = self._build(dry_run=True)
+        assert out["testbed"]["stored"] is False
+        assert srv._dynamic_testbeds.names() == []
+
+    def test_activate_routes_load_testbed_to_dynamic(self):
+        self._build(activate=True)
+        loaded = MagicMock()
+        with patch.object(srv.loader, "load", return_value=loaded) as ld:
+            assert srv._load_testbed() is loaded
+            assert srv._load_testbed() is loaded  # cached on the entry
+            assert ld.call_count == 1
+            raw = ld.call_args[0][0]
+            assert isinstance(raw, dict) and set(raw["devices"]) == {"r1", "r2"}
+
+    def test_activate_static_restores_file_testbed(self):
+        self._build(activate=True)
+        static_tb = _mock_testbed("core1", "core2")
+        with patch.object(srv.loader, "load", return_value=static_tb):
+            out = _json(_run(srv.pyats_testbed_activate("static")))
+            assert srv._load_testbed() is static_tb
+        assert out["status"] == "completed" and out["devices"] == 2
+        assert srv._dynamic_testbeds.active_entry() is None
+
+    def test_activate_drops_cached_connections(self):
+        dev = _mock_device("r1")
+        srv._conn_cache["r1"] = {"device": dev, "last_used": 0}
+        self._build()
+        _run(srv.pyats_testbed_activate("t1"))
+        assert srv._conn_cache == {}
+        dev.disconnect.assert_called_once()
+
+    def test_subprocess_path_is_materialized_secret_free_0600(self):
+        import yaml as _yaml
+
+        self._build(activate=True)
+        path = srv._active_testbed_path()
+        assert oct(os.stat(path).st_mode & 0o777) == "0o600"
+        doc = _yaml.safe_load(open(path))
+        assert doc["testbed"]["credentials"]["default"]["password"] == "%ENV{PYATS_DEVICE_PASSWORD}"
+        assert doc["devices"]["r2"]["os"] == "nxos"
+
+    def test_inline_secret_credentials_rejected(self):
+        out = self._build(credentials={"password_env": "hunter2!"})
+        assert out["status"] == "error" and "never pass secrets" in out["error"]
+
+    def test_unresolved_env_is_reported(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PYATS_DEVICE_PASSWORD", None)
+            out = self._build()
+        assert "PYATS_DEVICE_PASSWORD" in out["unresolved_env"]
+
+    def test_merge_with_static_keeps_static_devices(self):
+        static = {"testbed": {"name": "s", "credentials": {}}, "devices": {"core": {"os": "iosxe"}}}
+        with patch.object(srv, "_static_raw", return_value=static):
+            out = self._build(merge_with="static", name="merged")
+        assert out["status"] == "completed" and out["testbed"]["devices"] == 3
+
+    def test_delete_active_reverts(self):
+        self._build(activate=True)
+        out = _json(_run(srv.pyats_testbed_delete("t1")))
+        assert out["reverted_to_static"] is True and srv._dynamic_testbeds.active_entry() is None
+
+    def test_get_pages_and_single_device(self):
+        self._build()
+        page = _json(_run(srv.pyats_testbed_get("t1", limit=1)))
+        assert len(page["rows"]) == 1 and page["devices"] == 2
+        one = _json(_run(srv.pyats_testbed_get("t1", device="r1")))
+        assert one["definition"]["connections"]["cli"]["ip"] == "10.0.0.1"
+        assert _json(_run(srv.pyats_testbed_get("t1", device="zz")))["status"] == "error"
+
+    def test_validate_loads_with_pyats_schema(self):
+        self._build()
+        fake = MagicMock()
+        fake.devices = {"r1": 1, "r2": 2}
+        with patch.object(srv.loader, "load", return_value=fake):
+            out = _json(_run(srv.pyats_testbed_validate("t1")))
+        assert out["pyats_schema"].startswith("ok (2")
+
+    def test_validate_reports_schema_failure(self):
+        self._build()
+        with patch.object(srv.loader, "load", side_effect=ValueError("bad")):
+            out = _json(_run(srv.pyats_testbed_validate("t1")))
+        assert out["status"] == "invalid" and "FAILED" in out["pyats_schema"]
+
+    def test_tools_are_annotated_and_tasked(self):
+        from pyats_tasks import TASK_TOOLS
+
+        tools = {t.name: t for t in _run(srv.mcp.list_tools())}
+        assert tools["pyats_testbed_list"].annotations.read_only_hint is True
+        assert tools["pyats_testbed_delete"].annotations.destructive_hint is True
+        assert {"pyats_testbed_build", "pyats_testbed_validate"} <= TASK_TOOLS
+        assert not {"pyats_testbed_list", "pyats_testbed_activate"} & TASK_TOOLS
+
+    def test_sources_reports_allowlists(self):
+        out = _json(_run(srv.pyats_testbed_sources()))
+        assert out["status"] == "completed" and "itential_inventory" in out["sources"]
