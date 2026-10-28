@@ -359,7 +359,7 @@ The agent chains these itself — you describe the outcome, it picks the tools.
 
 ## Available Tools
 
-26 tools, grouped by what they do.
+34 tools, grouped by what they do.
 
 **Discovery**
 
@@ -416,11 +416,80 @@ The agent chains these itself — you describe the outcome, it picks the tools.
 | `pyats_rest_request` | Generic REST/RESTCONF/NX-API call via pyATS's `rest.connector` (a separate connection type from CLI/SSH) |
 | `pyats_xpresso_request` | Authenticated call to Cisco XPresso's REST API v2 (test requests, jobs, testbeds, images, …) |
 
+**Dynamic testbeds** — see [Dynamic Testbeds](#dynamic-testbeds)
+
+| Tool | Description |
+|------|-------------|
+| `pyats_testbed_sources` | Which sources are configured on the server, allow-lists, active testbed |
+| `pyats_testbed_source_inventories` | List Itential Inventory Manager inventories with node counts |
+| `pyats_testbed_build` | Build an in-memory testbed from Itential, NetBox, Nautobot, Catalyst Center, csv/json/yaml/xml or any REST API |
+| `pyats_testbed_validate` | pyATS schema check, credential env check, optional TCP reachability |
+| `pyats_testbed_activate` | Switch every other tool to a dynamic testbed (or back to `static`) |
+| `pyats_testbed_list` / `pyats_testbed_get` / `pyats_testbed_delete` | Inspect and manage in-memory testbeds |
+
 **Session**
 
 | Tool | Description |
 |------|-------------|
 | `pyats_get_operation_log` | Retrieve the in-memory operation log |
+
+---
+
+## Dynamic Testbeds
+
+Build a testbed **in memory, at runtime, from whatever your source of truth is** — no
+`testbed.yaml` round-trip. A testbed is a plain pyATS testbed dict handed straight to
+`pyats.topology.loader.load()`; a file is only materialized (mode `0600`) when a
+subprocess tool such as `pyats run job` or `pyats clean` needs a path.
+
+```
+pyats_testbed_sources              what can I build from, and what is active?
+pyats_testbed_source_inventories   list Itential Inventory Manager inventories (+ node counts)
+pyats_testbed_build                fetch -> map -> filter -> build (dry_run / activate / merge_with)
+pyats_testbed_validate             pyATS schema load + credential env check (+ TCP reachability)
+pyats_testbed_activate             make every other tool use it ("static" switches back)
+pyats_testbed_list / _get / _delete
+```
+
+| `source=` | Reads from | Server config |
+|-----------|-----------|---------------|
+| `itential_inventory` (default) | Itential Platform **Inventory Manager** (`/inventory_manager/v1`) | `PLATFORM_URL`, `AUTH_METHOD`, `CLIENT_ID`/`CLIENT_SECRET` (oauth) or `PLATFORM_USERNAME`/`PLATFORM_PASSWORD` (local) |
+| `netbox` / `nautobot` | `/api/dcim/devices/` | `NETBOX_URL`+`NETBOX_TOKEN` / `NAUTOBOT_URL`+`NAUTOBOT_TOKEN` |
+| `catalyst_center` | `/dna/intent/api/v1/network-device` | `CATALYST_CENTER_URL`, `_USERNAME`, `_PASSWORD` |
+| `inline` / `file` | csv, json, yaml or xml text / file | file must live under `PYATS_MCP_TESTBED_SOURCE_DIRS` |
+| `rest` | any JSON REST API (offset, page or next-URL pagination) | host must be listed in `PYATS_MCP_TESTBED_SOURCE_HOSTS` |
+
+Run more than one Itential Platform (for example a local devstack and a cloud SE
+Platform) with named profiles: `ITENTIAL_DEVSTACK_URL`, `ITENTIAL_DEVSTACK_AUTH_METHOD`,
+`ITENTIAL_DEVSTACK_CLIENT_ID`, `ITENTIAL_DEVSTACK_CLIENT_SECRET` (or `_USERNAME`/`_PASSWORD`),
+then `pyats_testbed_build(..., profile="devstack")`. Set `ITENTIAL_<PROFILE>_VERIFY_TLS=0`
+for self-signed lab certificates.
+
+**Mapping.** Presets map each source's records to devices. For anything else pass a
+declarative `mapping` — dotted paths (`a.b[0].c`, `tags[*].slug`), templates
+(`{site}-{name}`), `literal:` values or `{"path", "map", "regex", "default"}` objects:
+
+```json
+{"name": "build", "source": "inline", "format": "csv",
+ "data": "host,addr,nos\nr1,10.0.0.1,ios-xe\nr2,10.0.0.2,nx-os\n",
+ "mapping": {"name": "host", "ip": "addr", "os": "nos"}}
+```
+
+`os` values are normalized to pyATS names (`IOS-XE`→`iosxe`, `NX-OS`→`nxos`, `frr`→`linux`,
+...); use `os_map` for vendor-specific values or `default_os` when the source has no platform
+field (several real Itential inventories leave `itential_platform` blank). `filters` and `tags`
+narrow large sources, e.g. `tags=["firewall"]` against a 1,340-node inventory.
+
+**Credentials never pass through the model.** Generated devices reference server
+environment variables (`%ENV{PYATS_DEVICE_USERNAME}` / `_PASSWORD` / `_ENABLE_PASSWORD` by
+default; override with `credentials={"username_env": ..., "password_env": ...}`, or reuse the
+static testbed's block with `credentials={"from": "static"}`). Inline secrets are rejected,
+source-API tokens come from server env vars, and anything credential-shaped is redacted from
+previews. `merge_with="static"` adds the static testbed's devices to a dynamic one.
+
+`pyats_testbed_build` and `pyats_testbed_validate` do network I/O and run as
+[Asynchronous MCP Tasks](#asynchronous-mcp-tasks) when the client supports them. Set
+`PYATS_MCP_DYNAMIC_ONLY=1` to start the server without any static testbed file.
 
 ---
 
@@ -432,6 +501,7 @@ The agent chains these itself — you describe the outcome, it picks the tools.
 - `pyats_clean_device` never runs a real Genie Clean stage that reboots, erases, or reimages a device — only `connect`+`execute_command` are ever generated — and defaults to `dry_run=True`; running for real also requires an exact confirmation phrase.
 - Every process-global cache (connection cache, testbed cache, config/learn snapshots, operation log) is protected by a lock, so concurrent HTTP clients can't corrupt shared state.
 - All credentials come from `.env` — never stored in the testbed file or source code.
+- Dynamic testbeds hold only `%ENV{}` credential references; the generic `rest` source can only call allow-listed hosts, `file` only allow-listed directories, and pagination never follows a `next` link to another host.
 
 ---
 
@@ -440,6 +510,8 @@ The agent chains these itself — you describe the outcome, it picks the tools.
 ```
 .
 ├── pyats_mcp_server.py      # MCP server
+├── pyats_tasks.py           # MCP Tasks extension
+├── pyats_testbed_builder.py # Dynamic testbed sources, mapping and registry
 ├── test_pyats_mcp_server.py # Unit tests (119 tests)
 ├── benchmark/               # Pre/post, stateful/stateless transport benchmark
 ├── Dockerfile               # Container definition
