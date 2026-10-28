@@ -9,10 +9,16 @@ Point an agent at it and it can look up a device, run and parse a show command, 
 
 ---
 
+> [!TIP]
+> ### Testbed-free: build testbeds dynamically, in memory
+> You don't need a `testbed.yaml`. The `pyats_testbed_*` tools build a pyATS testbed **on the fly** from Itential Inventory Manager (the default source), NetBox, Nautobot, Catalyst Center, any JSON REST API, or inline/file CSV, JSON, YAML and XML, using a declarative field mapping. The testbed lives in server memory, is activated with one call, and every existing tool (`pyats_run_show_command`, `pyats_configure_device`, ...) uses it immediately. Start the server with `PYATS_MCP_DYNAMIC_ONLY=1` and no YAML at all. Credentials stay on the server as `%ENV{}` references and never pass through the model. See [Dynamic Testbeds](#dynamic-testbeds) and the [technical write-up](docs/dynamic-testbeds.md).
+
+---
+
 ## At a glance
 
 - **Transport** — Streamable HTTP (`mcp>=2.3.0`), stateful or stateless, chosen with one environment variable. STDIO is gone.
-- **26 tools** across discovery, show commands, configuration, Genie learn/diff, Genie Clean, declarative testing (Blitz, Robot Framework, AEtest), generic REST/RESTCONF, and Cisco XPresso.
+- **34 tools** across discovery, show commands, configuration, Genie learn/diff, Genie Clean, declarative testing (Blitz, Robot Framework, AEtest), generic REST/RESTCONF, and Cisco XPresso.
 - **Two ways to fan out** a command across many devices — a shared thread pool for everyday use, or one OS process per device (`pyats.async_.pcall`) when you want real isolation at scale.
 - **Guardrails, not honor systems** — dangerous commands are blocked before they reach a device, Genie Clean can never run a stage that reboots or reimages one, and destructive actions require an exact confirmation phrase.
 - **Nothing hard-coded** — every credential and device detail lives in `.env`, pulled into `testbed.yaml` at runtime via `%ENV{}` substitution.
@@ -22,7 +28,7 @@ Point an agent at it and it can look up a device, run and parse a show command, 
 ## Prerequisites
 
 - Python 3.10+
-- A pyATS `testbed.yaml` pointed at real or virtual network devices — a physical lab, Cisco Modeling Labs / VIRL / GNS3, or anything else Unicon can reach over SSH/Telnet. pyATS MCP doesn't simulate a network; it drives one.
+- A pyATS `testbed.yaml` pointed at real or virtual network devices — a physical lab, Cisco Modeling Labs / VIRL / GNS3, or anything else Unicon can reach over SSH/Telnet. pyATS MCP doesn't simulate a network; it drives one. A static `testbed.yaml` is optional: see [Dynamic Testbeds](#dynamic-testbeds).
 - An MCP-capable client to talk to it — see [Connect Your Agent](#connect-your-agent) below.
 
 ---

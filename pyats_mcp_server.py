@@ -3259,7 +3259,7 @@ def _fetch_records(
     source: str,
     inventory: Optional[Union[str, List[str]]],
     profile: Optional[str],
-    data: Optional[str],
+    data: Optional[Any],
     file_path: Optional[str],
     fmt: Optional[str],
     rest: Optional[Dict[str, Any]],
@@ -3281,7 +3281,9 @@ def _fetch_records(
     if source == "inline":
         if not data:
             raise tbb.TestbedBuildError("data is required for source='inline'")
-        return tbb.extract_records(tbb.parse_payload(data, fmt), records_path)
+        # MCP clients may hand structured JSON over as an object/array, not text.
+        parsed = data if isinstance(data, (list, dict)) else tbb.parse_payload(data, fmt)
+        return tbb.extract_records(parsed, records_path)
     if source == "file":
         if not file_path:
             raise tbb.TestbedBuildError("file_path is required for source='file'")
@@ -3410,7 +3412,7 @@ async def pyats_testbed_build(
     source: str = "itential_inventory",
     inventory: Optional[Union[str, List[str]]] = None,
     profile: Optional[str] = None,
-    data: Optional[str] = None,
+    data: Optional[Any] = None,
     file_path: Optional[str] = None,
     format: str = "auto",
     rest: Optional[Dict[str, Any]] = None,

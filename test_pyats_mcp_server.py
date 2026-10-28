@@ -1347,6 +1347,13 @@ class TestDynamicTestbeds(unittest.TestCase):
         with srv._STATE_LOCK:
             srv._testbed_cache["tb"] = None
 
+    def test_inline_accepts_structured_data(self):
+        recs = srv._fetch_records(
+            "inline", None, None, [{"h": "r1", "a": "10.0.0.1", "n": "ios"}],
+            None, "auto", None, None, 10,
+        )
+        self.assertEqual(recs[0]["h"], "r1")
+
     def tearDown(self):
         srv._dynamic_testbeds = self._orig
         self._tmp.cleanup()

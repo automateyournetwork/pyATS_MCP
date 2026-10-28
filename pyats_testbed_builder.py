@@ -814,7 +814,8 @@ def fetch_catalyst_center(max_records: int, session: Optional[requests.Session] 
     if not (base and user and pw):
         raise TestbedBuildError("set CATALYST_CENTER_URL, CATALYST_CENTER_USERNAME, CATALYST_CENTER_PASSWORD on the server")
     s = session or requests.Session()
-    s.verify = _env("CATALYST_CENTER_VERIFY_TLS") not in ("0", "false", "False")
+    verify = _env("CATALYST_CENTER_VERIFY_TLS") or _env("CATALYST_CENTER_VERIFY_SSL")
+    s.verify = verify not in ("0", "false", "False")
     r = s.post(f"{base}/dna/system/api/v1/auth/token", auth=(user, pw), timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     hdr = {"X-Auth-Token": r.json()["Token"]}
