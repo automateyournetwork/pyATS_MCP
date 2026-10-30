@@ -51,6 +51,19 @@ python3 pyats_mcp_server.py
 
 The MCP endpoint is then reachable at `http://<host>:<port>/mcp`.
 
+### With [uv](https://docs.astral.sh/uv/)
+
+```bash
+git clone https://github.com/automateyournetwork/pyATS_MCP
+cd pyATS_MCP
+cp .env.example .env   # edit — see Configuration below
+
+uv sync                              # creates .venv and installs dependencies
+uv run python pyats_mcp_server.py    # serves http://<host>:<port>/mcp
+```
+
+Requires Python 3.10+ (3.12 or older is the safest fit for `pyats[full]`). For development, add the dev extras with `uv sync --extra dev` and run `uv run pytest`.
+
 ---
 
 ## Configuration
